@@ -17,12 +17,12 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Chemistry",
     "Topic :: Scientific/Engineering :: Physics",
 ]
-keywords = ["aiida", "feff", "exafs", "xas"]
+keywords = ["aiida", "feff", "exafs", "xas", "md-exafs", "larch", "xraylarch", "ase", "pymatgen"]
 requires-python = ">=3.9"
 dependencies = [
     "aiida-core>=2.3,<3",
     "numpy>=1.21",
-    "pymatgen>=2024.1",
+    "pymatgen>=2024.1,<2026",
     "ase>=3.22",
     "xraylarch>=0.9.80",
     "h5py>=3.0",
@@ -32,8 +32,7 @@ dependencies = [
 plots = ["matplotlib>=3.6"]
 testing = [
     "pytest>=7.0",
-    "pytest-cov",
-    "aiida-core[testing]>=2.3,<3",
+    "pytest-cov"
 ]
 pre-commit = [
     "pre-commit>=3.0",
@@ -138,8 +137,11 @@ line-ending = "auto"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = [
-    "ignore::DeprecationWarning:aiida:",
-    "ignore::PendingDeprecationWarning:aiida:",
+    # AiiDA's test fixtures create a temporary config folder for each session.
+    "ignore:Creating AiiDA configuration folder:UserWarning",
+    # AiiDA/SQLAlchemy internal autoflush warnings in the psql_dos backend;
+    # not caused by plugin code.
+    "ignore::sqlalchemy.exc.SAWarning:aiida.storage.psql_dos:",
 ]
 
 [tool.mypy]

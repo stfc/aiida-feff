@@ -94,8 +94,8 @@ def _resolve_absorber_sites(
         If indices are out of range, empty, the spec is ambiguous, or
         the selected atoms belong to more than one element.
     """
-    atoms = structure.get_ase()
-    symbols = atoms.get_chemical_symbols()
+    pmg_structure = structure.get_pymatgen_structure()
+    symbols = [site.species_string for site in pmg_structure.sites]
     n = len(symbols)
 
     if isinstance(spec, int):

@@ -355,26 +355,23 @@ class FeffCalculation(CalcJob):
         """Construct the full text of ``feff.inp`` from AiiDA objects."""
         import tempfile
 
-        from pymatgen.io.ase import AseAtomsAdaptor
         from pymatgen.io.feff.sets import MPEXAFSSet
 
         absorbing_idx = parameters.get("absorbing_atom", 0)
         exclude_h = bool(parameters.get("exclude_hydrogen", False))
 
-        atoms = structure.get_ase()
+        pmg_structure: Structure = structure.get_pymatgen_structure()
 
         if exclude_h:
-            non_h = [i for i, sym in enumerate(atoms.get_chemical_symbols()) if sym != "H"]
+            symbols = [site.species_string for site in pmg_structure.sites]
+            non_h = [i for i, sym in enumerate(symbols) if sym != "H"]
             if absorbing_idx not in non_h:
                 raise ValueError(
                     f"absorbing_atom index {absorbing_idx} is a hydrogen atom "
                     "but exclude_hydrogen=True."
                 )
             absorbing_idx = non_h.index(absorbing_idx)
-            atoms = atoms[non_h]
-
-        adaptor = AseAtomsAdaptor()
-        pmg_structure: Structure = adaptor.get_structure(atoms)
+            pmg_structure.remove_sites([i for i, sym in enumerate(symbols) if sym == "H"])
 
         user_settings = parameters.to_pymatgen_user_tags()
         user_settings["RPATH"] = str(parameters.radius)
@@ -393,6 +390,12 @@ class FeffCalculation(CalcJob):
                 del_list.append(kw)
         if del_list:
             user_settings["_del"] = del_list
+
+        # spglib 2.7 deprecates the old error-handling path that pymatgen's
+        # SpacegroupAnalyzer still triggers; opt into the new path explicitly.
+        import spglib.error
+
+        spglib.error.OLD_ERROR_HANDLING = False
 
         feff_set = MPEXAFSSet(
             absorbing_atom=absorbing_idx,

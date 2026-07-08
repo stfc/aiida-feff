@@ -1,0 +1,163 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aiida-feff"
+version = "0.1.0"
+description = "AiiDA plugin for FEFF: provenance-tracked EXAFS calculations"
+authors = [{name = "J. Kane Shenton", email = "kane.shenton@stfc.ac.uk"}]
+readme = "README.md"
+license = {file = "LICENSE"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AiiDA",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+keywords = ["aiida", "feff", "exafs", "xas"]
+requires-python = ">=3.9"
+dependencies = [
+    "aiida-core>=2.3,<3",
+    "numpy>=1.21",
+    "pymatgen>=2024.1",
+    "ase>=3.22",
+    "xraylarch>=0.9.80",
+    "h5py>=3.0",
+]
+
+[project.optional-dependencies]
+plots = ["matplotlib>=3.6"]
+testing = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "aiida-core[testing]>=2.3,<3",
+]
+pre-commit = [
+    "pre-commit>=3.0",
+    "ruff>=0.6.0",
+    "mypy>=1.10",
+]
+docs = [
+    "sphinx>=5",
+    "sphinx-rtd-theme",
+]
+
+[project.urls]
+Home = "https://github.com/youruser/aiida-feff"
+Documentation = "https://aiida-feff.readthedocs.io"
+Source = "https://github.com/youruser/aiida-feff"
+Tracker = "https://github.com/youruser/aiida-feff/issues"
+
+[project.entry-points."aiida.calculations"]
+"feff.feff"       = "aiida_feff.calculations.feff:FeffCalculation"
+"feff.feff_batch" = "aiida_feff.calculations.feff_batch:FeffBatchCalculation"
+
+[project.entry-points."aiida.parsers"]
+"feff.feff"       = "aiida_feff.parsers.feff:FeffParser"
+"feff.feff_batch" = "aiida_feff.parsers.feff_batch:FeffBatchParser"
+
+[project.entry-points."aiida.data"]
+"feff.parameters"      = "aiida_feff.data.parameters:FeffParameters"
+"feff.xasdata"         = "aiida_feff.data.xasdata:XasData"
+"feff.pathcontributions" = "aiida_feff.data.pathcontributions:PathContributionsData"
+
+[project.entry-points."aiida.workflows"]
+"feff.ensemble" = "aiida_feff.workflows.ensemble:EnsembleExafsWorkChain"
+
+[project.entry-points."aiida.cmdline.data"]
+"feff" = "aiida_feff.cli:cmd_feff"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+exclude = [
+    ".git",
+    ".venv",
+    ".tox",
+    ".pytest_cache",
+    ".mypy_cache",
+    "__pycache__",
+    "build",
+    "dist",
+    "docs/_build",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "N",   # pep8-naming
+    "D",   # pydocstyle
+    "PL",  # pylint
+]
+ignore = [
+    "D100",  # Missing docstring in public module
+    "D104",  # Missing docstring in public package
+    "D203",  # 1 blank line required before class docstring (conflicts with D211)
+    "D213",  # Multi-line docstring summary should start at the second line (conflicts with D212)
+    "N806",  # Variable should be lowercase (too noisy for math/scientific notation)
+    "PLC0415", # Import outside top-level (intentional for optional deps and CLI lazy loading)
+    "PLR0915", # Too many statements (scientific scripts naturally exceed this)
+    "PLR2004", # Magic value comparisons are common in data parsing
+]
+[tool.ruff.lint.pylint]
+max-args = 12
+max-branches = 24
+max-statements = 100
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["D", "N806", "PLC0415", "B017", "E501", "PLR2004"]
+"examples/**/*.py" = ["D", "N806", "PLC0415", "E501", "PLR2004"]
+"src/aiida_feff/calculations/_aggregate_paths.py" = ["SIM105"]
+"src/aiida_feff/data/pathcontributions.py" = ["SIM108"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["aiida_feff"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning:aiida:",
+    "ignore::PendingDeprecationWarning:aiida:",
+]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+ignore_missing_imports = true
+exclude = [
+    "^tests/",
+    "^examples/",
+]
+show_error_codes = true
+
+[dependency-groups]
+dev = [
+    "mypy>=1.19.1",
+    "ruff>=0.15.20",
+]

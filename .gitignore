@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+
+# uv / venv
+.venv/
+.python-version
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# editors
+.vscode/
+.idea/
+*.swp
+
+# opencode
+.serena/
+
+# AiiDA
+.aiida/
+aiida.db

@@ -29,4 +29,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - run: uv sync --extra testing
-      - run: uv run pytest
+      - run: uv run pytest --cov=src/aiida_feff --cov-report=lcov
+      - name: Upload coverage to Coveralls
+        if: matrix.python-version == '3.12'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: uv run coveralls

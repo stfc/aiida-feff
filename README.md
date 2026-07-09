@@ -1,3 +1,8 @@
+[![Release](https://img.shields.io/github/v/release/stfc/aiida-feff)](https://github.com/stfc/aiida-feff/releases)
+[![PyPI](https://img.shields.io/pypi/v/aiida-feff)](https://pypi.org/project/aiida-feff/)
+[![Pipeline Status](https://github.com/stfc/aiida-feff/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/stfc/aiida-feff/actions)
+[![Coverage Status](https://coveralls.io/repos/github/stfc/aiida-feff/badge.svg?branch=main)](https://coveralls.io/github/stfc/aiida-feff?branch=main)
+
 # aiida-feff
 
 An [AiiDA](https://www.aiida.net) plugin for the

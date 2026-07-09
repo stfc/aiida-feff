@@ -22,27 +22,6 @@ class TestFeffParameters:
         with pytest.raises(Exception):
             FeffParameters(dict={"s02": 0.9}).validate()
 
-    def test_to_feff_cards_contains_edge(self, generate_feff_parameters):
-        p = generate_feff_parameters()
-        cards = p.to_feff_cards()
-        assert any("EDGE" in c and "K" in c for c in cards)
-
-    def test_to_feff_cards_exafs_mode(self, generate_feff_parameters):
-        p = generate_feff_parameters(spectrum_type="EXAFS")
-        cards = p.to_feff_cards()
-        assert any(c.strip() == "EXAFS" for c in cards)
-
-    def test_extra_cards_pass_through(self):
-        p = FeffParameters(
-            dict={
-                "edge": "L3",
-                "extra_cards": ["NOGEOM", "PRINT 0 0 0 0 0 3"],
-            }
-        )
-        cards = p.to_feff_cards()
-        assert "NOGEOM" in cards
-        assert "PRINT 0 0 0 0 0 3" in cards
-
     def test_edge_property(self, generate_feff_parameters):
         p = generate_feff_parameters(edge="L2")
         assert p.edge == "L2"
@@ -62,8 +41,7 @@ class TestFeffParameters:
         assert "SCF" not in tags_none
         assert "SCF" in tags_none.get("_del", [])
 
-        cards_none = p_none.to_feff_cards()
-        assert not any("SCF" in c for c in cards_none)
+
 
 
 class TestXasData:

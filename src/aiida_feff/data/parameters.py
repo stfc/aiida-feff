@@ -173,27 +173,6 @@ class FeffParameters(Dict):
 
         return tags
 
-    # kept as a minimal fallback for environments without pymatgen
-    def to_feff_cards(self) -> list[str]:
-        """Return FEFF control card strings."""
-        d = self.get_dict()
-        lines: list[str] = []
-        if d.get("title"):
-            lines.append(f"TITLE {d['title']}")
-        lines.append(f"EDGE   {d['edge']}")
-        lines.append(f"S02    {float(d.get('s02', 1.0)):.4f}")
-        lines.append("EXAFS")
-        lines.append(f"RPATH  {self.radius:.4f}")
-        lines.append(f"NLEG   {d.get('nleg', 6)}")
-        if d.get("criteria"):
-            lines.append(f"CRITERIA  {d['criteria']}")
-        scf_val = d.get("scf")
-        if scf_val is not None:
-            lines.append(f"SCF    {scf_val}")
-        for card in d.get("extra_cards", []):
-            lines.append(card)
-        return lines
-
 
 # ---------------------------------------------------------------------------
 # FEFF card normalisation  (same rules as FeffConfig._normalize_tag)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 
 from aiida import orm
@@ -353,8 +352,6 @@ class FeffCalculation(CalcJob):
         parameters: FeffParameters,
     ) -> str:
         """Construct the full text of ``feff.inp`` from AiiDA objects."""
-        import tempfile
-
         from pymatgen.io.feff.sets import MPEXAFSSet
 
         absorbing_idx = parameters.get("absorbing_atom", 0)
@@ -405,11 +402,5 @@ class FeffCalculation(CalcJob):
             user_tag_settings=user_settings,
         )
 
-        original_cwd = os.getcwd()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            try:
-                feff_set.write_input(tmpdir)
-            finally:
-                os.chdir(original_cwd)
-            inp_path = Path(tmpdir) / "feff.inp"
-            return inp_path.read_text()
+        feff = feff_set.all_input()
+        return "\n\n".join(str(feff[k]) for k in ["HEADER", "PARAMETERS", "POTENTIALS", "ATOMS"] if k in feff)

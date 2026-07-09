@@ -33,6 +33,7 @@ from collections import defaultdict
 from typing import Any
 
 import numpy as np
+from ase.geometry import find_mic
 from aiida.engine import calcfunction
 from aiida.orm import ArrayData, Dict
 from aiida.orm import TrajectoryData as _TrajectoryData
@@ -133,36 +134,6 @@ def _process_positions(
     return unwrapped
 
 
-def _find_mic_vectors(
-    displacements: np.ndarray,
-    cell: np.ndarray,
-    pbc: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Apply minimum-image convention to an array of displacement vectors.
-
-    Parameters
-    ----------
-    displacements:
-        Shape ``(n_frames, 3)``.
-    cell:
-        Shape ``(3, 3)`` — cell matrix.
-    pbc:
-        Shape ``(3,)`` bool array.
-
-    Returns:
-    -------
-    mic_vectors  shape ``(n_frames, 3)``
-    distances    shape ``(n_frames,)``
-    """
-    if not np.any(pbc):
-        mic = displacements.copy()
-    else:
-        inv_cell = np.linalg.inv(cell)
-        frac = displacements @ inv_cell.T
-        frac -= np.round(frac)
-        mic = frac @ cell
-    return mic, np.linalg.norm(mic, axis=1)
-
 
 def _compute_adp_impl(
     positions_proc: np.ndarray,
@@ -185,7 +156,7 @@ def _calculate_grouped_msrd_impl(
     positions_proc: np.ndarray,
     symbols: list[str],
     cell: np.ndarray,
-    pbc: np.ndarray,
+    pbc: list[bool],
     central_indices: list[int],
     *,
     cutoff: float = 3.5,
@@ -231,14 +202,14 @@ def _calculate_grouped_msrd_impl(
         # Find neighbours within cutoff using reference frame
         all_cand = [i for i in range(len(symbols)) if i != c_idx and i in eligible]
         raw_disp = ref_pos[all_cand] - ref_pos[c_idx]
-        _, ref_dists = _find_mic_vectors(raw_disp, cell, pbc)
+        _, ref_dists = find_mic(raw_disp, cell, pbc)  # type: ignore[arg-type]
         neighbors = [all_cand[i] for i, d in enumerate(ref_dists) if d < cutoff]
 
         # Pre-compute MIC vectors over all frames for each neighbour
         mic_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for n_idx in neighbors:
             raw = positions_proc[:, n_idx, :] - positions_proc[:, c_idx, :]
-            mic_v, dists = _find_mic_vectors(raw, cell, pbc)
+            mic_v, dists = find_mic(raw, cell, pbc)  # type: ignore[arg-type]
             mic_cache[n_idx] = (mic_v, dists)
 
         # --- 2-body ---
@@ -270,7 +241,7 @@ def _calculate_grouped_msrd_impl(
                 v01, d01 = mic_cache[n1]
                 v02, d02 = mic_cache[n2]
                 raw12 = positions_proc[:, n2, :] - positions_proc[:, n1, :]
-                _v12, d12 = _find_mic_vectors(raw12, cell, pbc)
+                _v12, d12 = find_mic(raw12, cell, pbc)  # type: ignore[arg-type]
                 L = d01 + d12 + d02
 
                 v1 = -v01
@@ -473,7 +444,7 @@ def compute_msrd(
     except KeyError:
         cells = np.zeros((len(positions), 3, 3))
 
-    pbc = np.array([True, True, True])
+    pbc = [True, True, True]
     ref_cell = cells[0]
 
     central_indices = _parse_site_spec(absorber_site, symbols)

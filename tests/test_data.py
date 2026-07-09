@@ -42,8 +42,6 @@ class TestFeffParameters:
         assert "SCF" in tags_none.get("_del", [])
 
 
-
-
 class TestXasData:
     def test_set_and_get_spectrum(self, generate_xas_data):
         xas = generate_xas_data()

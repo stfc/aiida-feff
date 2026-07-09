@@ -33,10 +33,10 @@ from collections import defaultdict
 from typing import Any
 
 import numpy as np
-from ase.geometry import find_mic
 from aiida.engine import calcfunction
 from aiida.orm import ArrayData, Dict
 from aiida.orm import TrajectoryData as _TrajectoryData
+from ase.geometry import find_mic
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +134,6 @@ def _process_positions(
     return unwrapped
 
 
-
 def _compute_adp_impl(
     positions_proc: np.ndarray,
     symbols: list[str],
@@ -152,8 +151,42 @@ def _compute_adp_impl(
     }
 
 
+def _max_safe_mic_cutoff(cell: np.ndarray) -> float | None:
+    """Largest sphere radius that fits inside a parallelepiped cell.
+
+    For the MIC to be unambiguous the cutoff must be less than half the
+    smallest perpendicular distance between opposite faces of the cell.
+
+    Returns ``None`` when the cell has zero volume.
+    """
+    cell = np.asarray(cell)
+    if cell.shape != (3, 3):
+        return None
+    volume = float(np.abs(np.linalg.det(cell)))
+    if volume <= 0.0:
+        return None
+    area_ab = float(np.linalg.norm(np.cross(cell[0], cell[1])))
+    area_bc = float(np.linalg.norm(np.cross(cell[1], cell[2])))
+    area_ca = float(np.linalg.norm(np.cross(cell[2], cell[0])))
+    if 0.0 in (area_ab, area_bc, area_ca):
+        return None
+    return min(volume / area_ab, volume / area_bc, volume / area_ca) / 2.0
+
+
+def _cluster_by_tolerance(items: list[dict], key: str, tol: float) -> list[list[dict]]:
+    """Sort *items* by *key* and greedily cluster where consecutive means are within *tol*."""
+    items = sorted(items, key=lambda x: x[key])
+    clusters: list[list[dict]] = [[items[0]]]
+    for item in items[1:]:
+        if abs(item[key] - np.mean([x[key] for x in clusters[-1]])) <= tol:
+            clusters[-1].append(item)
+        else:
+            clusters.append([item])
+    return clusters
+
+
 def _calculate_grouped_msrd_impl(
-    positions_proc: np.ndarray,
+    positions: np.ndarray,
     symbols: list[str],
     cell: np.ndarray,
     pbc: list[bool],
@@ -169,8 +202,10 @@ def _calculate_grouped_msrd_impl(
 
     Parameters
     ----------
-    positions_proc:
-        Shape ``(n_frames, n_atoms, 3)`` — already unwrapped and aligned.
+    positions:
+        Shape ``(n_frames, n_atoms, 3)`` — raw (non-aligned) positions.
+        Must NOT be Kabsch-aligned: alignment rotates the frame, making
+        coordinates inconsistent with the static cell matrix used by find_mic.
     symbols:
         Chemical symbol per atom.
     cell / pbc:
@@ -188,10 +223,29 @@ def _calculate_grouped_msrd_impl(
     exclude_hydrogen:
         When True, H atoms are excluded from the neighbour search.
     """
+    # Warn if any cutoff exceeds the largest sphere that fits in the cell.
+    # Beyond this radius the MIC becomes ambiguous for non-orthogonal cells.
+    max_safe = _max_safe_mic_cutoff(cell)
+    if max_safe is not None:
+        for name, value in [("cutoff", cutoff), ("cutoff_3body", cutoff_3body)]:
+            if value is not None and value > 0 and value > max_safe:
+                logger.warning(
+                    "%s=%.3f Å exceeds the maximum safe MIC cutoff "
+                    "for this unit cell (%.3f Å). Distances may be "
+                    "ambiguous because the sphere overlaps with its "
+                    "own periodic images. Consider using a supercell or "
+                    "reducing %s to <= %.3f Å.",
+                    name,
+                    value,
+                    max_safe,
+                    name,
+                    max_safe,
+                )
+
     central_element = symbols[central_indices[0]]
 
     # Reference distances from frame 0
-    ref_pos = positions_proc[0]
+    ref_pos = positions[0]
 
     eligible = {i for i, sym in enumerate(symbols) if (not exclude_hydrogen or sym != "H")}
 
@@ -208,7 +262,7 @@ def _calculate_grouped_msrd_impl(
         # Pre-compute MIC vectors over all frames for each neighbour
         mic_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for n_idx in neighbors:
-            raw = positions_proc[:, n_idx, :] - positions_proc[:, c_idx, :]
+            raw = positions[:, n_idx, :] - positions[:, c_idx, :]
             mic_v, dists = find_mic(raw, cell, pbc)  # type: ignore[arg-type]
             mic_cache[n_idx] = (mic_v, dists)
 
@@ -240,7 +294,7 @@ def _calculate_grouped_msrd_impl(
                 n1, n2 = nb3[i], nb3[j]
                 v01, d01 = mic_cache[n1]
                 v02, d02 = mic_cache[n2]
-                raw12 = positions_proc[:, n2, :] - positions_proc[:, n1, :]
+                raw12 = positions[:, n2, :] - positions[:, n1, :]
                 _v12, d12 = find_mic(raw12, cell, pbc)  # type: ignore[arg-type]
                 L = d01 + d12 + d02
 
@@ -271,15 +325,7 @@ def _calculate_grouped_msrd_impl(
         by_elem[p["element"]].append(p)
 
     for _elem, paths in by_elem.items():
-        paths.sort(key=lambda x: x["mean_d"])
-        clusters: list[list] = [[paths[0]]]
-        for p in paths[1:]:
-            ctr = np.mean([x["mean_d"] for x in clusters[-1]])
-            if abs(p["mean_d"] - ctr) <= tol_dist:
-                clusters[-1].append(p)
-            else:
-                clusters.append([p])
-        for cl in clusters:
+        for cl in _cluster_by_tolerance(paths, "mean_d", tol_dist):
             all_d = np.concatenate([p["dists"] for p in cl])
             res_2b.append(
                 {
@@ -298,25 +344,8 @@ def _calculate_grouped_msrd_impl(
         by_pair[p["elements"]].append(p)
 
     for elem_pair, paths in by_pair.items():
-        paths.sort(key=lambda x: x["angle"])
-        ang_clusters: list[list] = [[paths[0]]]
-        for p in paths[1:]:
-            ctr = np.mean([x["angle"] for x in ang_clusters[-1]])
-            if abs(p["angle"] - ctr) <= tol_angle:
-                ang_clusters[-1].append(p)
-            else:
-                ang_clusters.append([p])
-
-        for ang_cl in ang_clusters:
-            ang_cl.sort(key=lambda x: x["mean_L"])
-            dist_clusters: list[list] = [[ang_cl[0]]]
-            for p in ang_cl[1:]:
-                ctr = np.mean([x["mean_L"] for x in dist_clusters[-1]])
-                if abs(p["mean_L"] - ctr) <= tol_dist:
-                    dist_clusters[-1].append(p)
-                else:
-                    dist_clusters.append([p])
-            for cl in dist_clusters:
+        for ang_cl in _cluster_by_tolerance(paths, "angle", tol_angle):
+            for cl in _cluster_by_tolerance(ang_cl, "mean_L", tol_dist):
                 all_r = np.concatenate([p["reff_series"] for p in cl])
                 res_3b.append(
                     {
@@ -406,8 +435,6 @@ def compute_msrd(
             Leg cutoff for 3-body paths.  ``None`` / ``0`` → 2-body only.
         ``skip_frames`` : int, default 0
             Discard the first N frames (equilibration).
-        ``align`` : bool, default True
-            Apply two-pass Kabsch alignment after PBC unwrapping.
         ``exclude_hydrogen`` : bool, default False
             Exclude H atoms from the neighbour search.
 
@@ -434,7 +461,6 @@ def compute_msrd(
     tol_angle = float(params.get("tol_angle", 5.0))
     cutoff_3body = params.get("cutoff_3body")
     skip = int(params.get("skip_frames", 0))
-    align = bool(params.get("align", True))
     excl_h = bool(params.get("exclude_hydrogen", False))
 
     positions = trajectory.get_array("positions")[skip:]
@@ -455,10 +481,11 @@ def compute_msrd(
         len(positions),
     )
 
-    positions_proc = _process_positions(positions, cells, align=align)
-
+    # Raw positions passed directly — Kabsch alignment would rotate the frame,
+    # making coords inconsistent with the static cell matrix used by find_mic
+    # (wrong MIC for non-orthogonal cells). _process_positions is for compute_adp only.
     res_2b, res_3b = _calculate_grouped_msrd_impl(
-        positions_proc,
+        positions,
         symbols,
         ref_cell,
         pbc,

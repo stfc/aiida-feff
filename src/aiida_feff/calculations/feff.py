@@ -403,4 +403,6 @@ class FeffCalculation(CalcJob):
         )
 
         feff = feff_set.all_input()
-        return "\n\n".join(str(feff[k]) for k in ["HEADER", "PARAMETERS", "POTENTIALS", "ATOMS"] if k in feff)
+        return "\n\n".join(
+            str(feff[k]) for k in ["HEADER", "PARAMETERS", "POTENTIALS", "ATOMS"] if k in feff
+        )

@@ -74,13 +74,14 @@ def split_trajectory(trajectory, params: Dict) -> dict:
     ``step_ids`` : list[int]
         Frame indices to extract.
 
-    Returns a dynamic output namespace ``{'frame_0000': StructureData, ...}``
-    so every snapshot has a ``CREATE`` link back to the trajectory in the
+    Returns a dynamic output namespace ``{'frame_{step_id:04d}': StructureData, ...}``
+    where ``step_id`` is the original trajectory index passed in ``step_ids``.
+    Every snapshot has a ``CREATE`` link back to the trajectory in the
     provenance graph.
     """
     step_ids: list[int] = params["step_ids"]
     structures = trajectory_to_structures(trajectory, step_ids=step_ids)
-    return {f"frame_{i:04d}": s for i, s in enumerate(structures)}
+    return {f"frame_{step_id:04d}": s for step_id, s in zip(step_ids, structures, strict=False)}
 
 
 @calcfunction

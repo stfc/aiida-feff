@@ -220,8 +220,13 @@ class FeffBatchCalculation(CalcJob):
             d["absorbing_atom"] = site_idx
             params = FeffParameters(dict=d)  # unstored; only used to build feff.inp
 
+            # AiiDA's Folder.open does not create intermediate directories, so
+            # create the per-snapshot subfolder before writing feff.inp /
+            # _feff_aggregate_config.json into it.
+            snap_folder = folder.get_subfolder(run_label, create=True)
+
             inp_text = FeffCalculation._build_feff_inp(structure, params)
-            with folder.open(f"{run_label}/feff.inp", "w") as fh:
+            with snap_folder.open("feff.inp", "w") as fh:
                 fh.write(inp_text)
 
             if do_aggregate:
@@ -239,7 +244,7 @@ class FeffBatchCalculation(CalcJob):
                     "site_idx": site_idx,
                     "absorber_element": absorber_element,
                 }
-                with folder.open(f"{run_label}/_feff_aggregate_config.json", "w") as fh:
+                with snap_folder.open("_feff_aggregate_config.json", "w") as fh:
                     json.dump(agg_cfg, fh)
 
         # ----------------------------------------------------------------

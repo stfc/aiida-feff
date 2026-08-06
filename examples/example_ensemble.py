@@ -70,7 +70,7 @@ def main(code, traj_pk, step_every, edge, rpath):
     params.store()
 
     inputs = {
-        "structures": orm.List(list=[s.pk for s in structures]),
+        "structures": {f"frame_{i:04d}": s for i, s in enumerate(structures)},
         "parameters": params,
         "code": code_node,
         "max_iterations": orm.Int(3),

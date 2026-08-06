@@ -173,13 +173,14 @@ class EnsembleExafsWorkChain(WorkChain):
 
     Inputs
     ------
-    structures : :class:`~aiida.orm.List`, optional
-        MD snapshots as a list of :class:`~aiida.orm.StructureData` nodes or
-        integer PKs.  Either this **or** ``trajectory`` must be supplied.
+    structures : dynamic namespace of :class:`~aiida.orm.StructureData`, optional
+        Snapshot structures keyed by frame label (e.g. ``frame_0000``).  This is
+        the single intake point for both single-structure and ensemble
+        calculations.  Either this **or** ``trajectory`` must be supplied.
     trajectory : :class:`~aiida.orm.TrajectoryData`, optional
-        AiiDA trajectory node.  Will be split into
-        :class:`~aiida.orm.StructureData` instances automatically.
-        Use ``sample_interval`` to sub-sample long trajectories.
+        Deprecated convenience input.  Will be split into a ``structures``
+        namespace automatically using ``sample_interval``.  Prefer passing a
+        ``structures`` namespace directly.
     sample_interval : :class:`~aiida.orm.Int`, optional, default 1
         Take every *N*-th frame from ``trajectory``.  Ignored when
         ``structures`` is used.
@@ -228,20 +229,32 @@ class EnsembleExafsWorkChain(WorkChain):
         Merged per-path FEFF data; filter by the ``site_idx`` column post-hoc
         to compare scattering paths per absorber site.
 
-    Usage — single absorber site (backward-compatible)::
+    Usage — single structure::
 
-        params = FeffParameters(dict={"edge": "K", "absorbing_atom": 0, ...})
-        node = submit(EnsembleExafsWorkChain, trajectory=traj, parameters=params, ...)
+        builder = EnsembleExafsWorkChain.get_builder()
+        builder.structures.frame_0000 = structure
+        builder.parameters = params
+        builder.code = code
+        node = submit(builder)
 
-    Usage — all Cu sites (element string)::
+    Usage — all Cu sites from a trajectory::
 
         params = FeffParameters(dict={"edge": "K", "absorbing_atoms": "Cu", ...})
-        node = submit(EnsembleExafsWorkChain, trajectory=traj, parameters=params, ...)
+        builder = EnsembleExafsWorkChain.get_builder()
+        builder.trajectory = traj
+        builder.parameters = params
+        builder.code = code
+        node = submit(builder)
 
-    Usage — explicit site indices::
+    Usage — explicit structures namespace (single absorber site)::
 
-        params = FeffParameters(dict={"edge": "K", "absorbing_atoms": [0, 1, 2], ...})
-        node = submit(EnsembleExafsWorkChain, ...)
+        params = FeffParameters(dict={"edge": "K", "absorbing_atom": 0, ...})
+        builder = EnsembleExafsWorkChain.get_builder()
+        for label, structure in structures.items():
+            builder.structures[label] = structure
+        builder.parameters = params
+        builder.code = code
+        node = submit(builder)
 
     Accessing outputs after completion::
 
@@ -255,17 +268,26 @@ class EnsembleExafsWorkChain(WorkChain):
         """Define inputs, outputs and outline of the workchain."""
         super().define(spec)
 
-        spec.input(
+        spec.input_namespace(
             "structures",
-            valid_type=orm.List,
+            valid_type=orm.StructureData,
+            dynamic=True,
             required=False,
-            help="List of StructureData PKs (int) or StructureData nodes.",
+            help=(
+                "Dynamic namespace of StructureData nodes keyed by frame label. "
+                "This is the single intake point for both single-structure and "
+                "ensemble calculations. Either this or ``trajectory`` must be supplied."
+            ),
         )
         spec.input(
             "trajectory",
             valid_type=orm.TrajectoryData,
             required=False,
-            help="MD trajectory; split into StructureData snapshots automatically.",
+            help=(
+                "Deprecated convenience input: MD trajectory that will be "
+                "split into StructureData snapshots automatically using ``sample_interval``. "
+                "Prefer passing a ``structures`` namespace directly."
+            ),
         )
         spec.input(
             "sample_interval",
@@ -420,7 +442,7 @@ class EnsembleExafsWorkChain(WorkChain):
     def validate_inputs(self) -> None:
         """Load/split structure nodes into context."""
         if "structures" in self.inputs and "trajectory" in self.inputs:
-            raise ValueError("Supply either 'structures' or 'trajectory', not both.")
+            raise ValueError("Supply either 'structures' namespace or 'trajectory', not both.")
 
         if "trajectory" in self.inputs:
             interval = self.inputs.sample_interval.value
@@ -436,23 +458,12 @@ class EnsembleExafsWorkChain(WorkChain):
                 f"Trajectory has {n_steps} frames; sampling every {interval} → "
                 f"{len(structures)} snapshot(s)."
             )
-        elif "structures" in self.inputs:
-            raw = self.inputs.structures.get_list()
-            structures = []
-            for item in raw:
-                if isinstance(item, int):
-                    structures.append(t.cast(orm.StructureData, orm.load_node(item)))
-                elif isinstance(item, orm.StructureData):
-                    structures.append(item)
-                else:
-                    raise ValueError(
-                        f"structures list must contain StructureData nodes or integer PKs, "
-                        f"got {type(item)}"
-                    )
+        elif "structures" in self.inputs and len(self.inputs.structures) > 0:
+            structures = [self.inputs.structures[k] for k in sorted(self.inputs.structures.keys())]
             # Ensure all nodes are stored before placing in ctx (checkpoint safety).
             structures = [s if s.is_stored else s.store() for s in structures]
         else:
-            raise ValueError("Either 'structures' or 'trajectory' must be supplied.")
+            raise ValueError("Either 'structures' namespace or 'trajectory' must be supplied.")
 
         self.ctx.structures = structures
         self.report(f"Validated {len(structures)} snapshot structure(s).")
@@ -475,6 +486,18 @@ class EnsembleExafsWorkChain(WorkChain):
         """Return True when batch_size is set (batch CalcJob mode)."""
         return "batch_size" in self.inputs
 
+    def _feff_options(self) -> dict[str, t.Any]:
+        """Return scheduler options with a safe default for resources.
+
+        AiiDA CalcJobs require ``metadata.options.resources`` to be set.  When the
+        caller does not supply options (e.g. a local test run), we default to a
+        single machine so that the fan-out of FeffCalculations still validates.
+        """
+        options: dict[str, t.Any] = self.inputs.get("options", orm.Dict()).get_dict()
+        if "resources" not in options:
+            options["resources"] = {"num_machines": 1}
+        return options
+
     def precompute_potentials_step(self):
         """Submit one FEFF potentials-only run per absorber site.
 
@@ -494,7 +517,7 @@ class EnsembleExafsWorkChain(WorkChain):
         # Remove absorbing_atoms — each pot run uses a concrete absorbing_atom
         d.pop("absorbing_atoms", None)
 
-        options = self.inputs.get("options", orm.Dict()).get_dict()
+        options = self._feff_options()
         futures: dict[str, t.Any] = {}
 
         for site_idx in self.ctx.site_indices:
@@ -563,7 +586,7 @@ class EnsembleExafsWorkChain(WorkChain):
             return self.exit_codes.ERROR_MISSING_AGGREGATION_CODE  # type: ignore[no-any-return]
 
         batch_size = self.inputs.batch_size.value
-        options = self.inputs.get("options", orm.Dict()).get_dict()
+        options = self._feff_options()
         use_precomputed = self.should_precompute() and hasattr(self.ctx, "pot_remote")
 
         base_d = self.inputs.parameters.get_dict()
@@ -578,16 +601,13 @@ class EnsembleExafsWorkChain(WorkChain):
         self.ctx.job_pairs = job_pairs
         self.ctx.n_total = len(job_pairs)
 
-        # Convert structures list → TrajectoryData if we don't already have one.
-        # The batch CalcJob always receives a TrajectoryData (single node, clean provenance).
-        if "trajectory" in self.inputs:
-            traj = self.inputs.trajectory
-        else:
-            # structures input path: pack into a trajectory via provenance-tracked calcfunction
-            traj = structures_to_trajectory(
-                **{f"s{i:04d}": s for i, s in enumerate(self.ctx.structures)},
-                metadata={"call_link_label": "structures_to_trajectory_for_batch"},
-            )
+        # Convert the structures we will actually use into a single TrajectoryData.
+        # The batch CalcJob receives frame indices into this packed trajectory, so
+        # the indices stay 0..N-1 even when a trajectory input was sub-sampled.
+        traj = structures_to_trajectory(
+            **{f"s{i:04d}": s for i, s in enumerate(self.ctx.structures)},
+            metadata={"call_link_label": "structures_to_trajectory_for_batch"},
+        )
 
         # Split pairs into chunks and submit one FeffBatchCalculation per chunk
         calcs: dict[str, t.Any] = {}
@@ -675,7 +695,7 @@ class EnsembleExafsWorkChain(WorkChain):
     def submit_feff_calculations(self):
         """Fan out: submit one FeffCalculation per (frame, site) pair."""
         calcs: dict[str, t.Any] = {}
-        options = self.inputs.get("options", orm.Dict()).get_dict()
+        options = self._feff_options()
         use_precomputed = self.should_precompute() and hasattr(self.ctx, "pot_remote")
         job_pairs: list[tuple[int, int]] = []
 

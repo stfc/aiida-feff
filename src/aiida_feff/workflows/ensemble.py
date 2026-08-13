@@ -178,9 +178,10 @@ class EnsembleExafsWorkChain(WorkChain):
         the single intake point for both single-structure and ensemble
         calculations.  Either this **or** ``trajectory`` must be supplied.
     trajectory : :class:`~aiida.orm.TrajectoryData`, optional
-        Deprecated convenience input.  Will be split into a ``structures``
-        namespace automatically using ``sample_interval``.  Prefer passing a
-        ``structures`` namespace directly.
+        MD trajectory to split into snapshots during workflow execution.
+    step_ids : :class:`~aiida.orm.List`, optional
+        Explicit trajectory step IDs to calculate. Takes precedence over
+        ``sample_interval`` when supplied.
     sample_interval : :class:`~aiida.orm.Int`, optional, default 1
         Take every *N*-th frame from ``trajectory``.  Ignored when
         ``structures`` is used.
@@ -283,10 +284,15 @@ class EnsembleExafsWorkChain(WorkChain):
             "trajectory",
             valid_type=orm.TrajectoryData,
             required=False,
+            help=("MD trajectory split into StructureData snapshots during workflow execution."),
+        )
+        spec.input(
+            "step_ids",
+            valid_type=orm.List,
+            required=False,
             help=(
-                "Deprecated convenience input: MD trajectory that will be "
-                "split into StructureData snapshots automatically using ``sample_interval``. "
-                "Prefer passing a ``structures`` namespace directly."
+                "Explicit trajectory step IDs to calculate. Takes precedence over "
+                "``sample_interval``."
             ),
         )
         spec.input(
@@ -445,19 +451,26 @@ class EnsembleExafsWorkChain(WorkChain):
             raise ValueError("Supply either 'structures' namespace or 'trajectory', not both.")
 
         if "trajectory" in self.inputs:
-            interval = self.inputs.sample_interval.value
             traj = self.inputs.trajectory
             n_steps = len(traj.get_array("positions"))
-            step_ids = list(range(0, n_steps, interval))
+            if "step_ids" in self.inputs:
+                step_ids = self.inputs.step_ids.get_list()
+                if not step_ids:
+                    raise ValueError("At least one trajectory step ID must be supplied.")
+                invalid_ids = [step_id for step_id in step_ids if step_id not in traj.get_stepids()]
+                if invalid_ids:
+                    raise ValueError(f"Unknown trajectory step IDs: {invalid_ids}")
+                indices = [traj.get_index_from_stepid(step_id) for step_id in step_ids]
+            else:
+                interval = self.inputs.sample_interval.value
+                indices = list(range(0, n_steps, interval))
+                step_ids = list(traj.get_stepids())[::interval]
 
             # split_trajectory is a @calcfunction: each StructureData gets a
             # CREATE link back to the TrajectoryData in the provenance graph.
-            result = split_trajectory(traj, orm.Dict({"step_ids": step_ids}))
+            result = split_trajectory(traj, orm.Dict({"step_ids": indices}))
             structures: list[orm.StructureData] = [result[k] for k in sorted(result.keys())]
-            self.report(
-                f"Trajectory has {n_steps} frames; sampling every {interval} → "
-                f"{len(structures)} snapshot(s)."
-            )
+            self.report(f"Trajectory has {n_steps} frames; selected {len(structures)} snapshot(s).")
         elif "structures" in self.inputs and len(self.inputs.structures) > 0:
             structures = [self.inputs.structures[k] for k in sorted(self.inputs.structures.keys())]
             # Ensure all nodes are stored before placing in ctx (checkpoint safety).

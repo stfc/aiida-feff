@@ -43,6 +43,17 @@ pip install aiida-feff[plots]
 
 ## Quick start
 
+### Experimental spectrum import
+
+`aiida_feff.calcfunctions.experimental.import_experimental_spectrum` adapts
+Larch's readers to a provenance-tracked `XasData` node. Pass a stored
+`SinglefileData` upload and a `Dict` of Larch import options, such as plain
+text column labels or a selected Athena group. The raw file remains an input
+node; the plugin does not implement a competing file parser.
+
+`scale_simulated_spectrum` stores a separate $S_0^2$/ΔE₀-adjusted simulated
+`XasData` node for reproducible experimental comparisons.
+
 ### 1. Register your FEFF code
 
 ```bash

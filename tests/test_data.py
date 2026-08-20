@@ -162,3 +162,60 @@ class TestResolveAbsorberSites:
 
         with pytest.raises(ValueError, match="must not be empty"):
             _resolve_absorber_sites(cu_structure, [])
+
+
+class TestFeffParametersKeyValidation:
+    """An accepted-but-ignored key produces a default FEFF run silently."""
+
+    def test_unknown_key_rejected(self):
+        with pytest.raises(ValueError, match="Unknown FeffParameters key"):
+            FeffParameters(dict={"edge": "K", "not_a_card": 1})
+
+    @pytest.mark.parametrize(
+        ("wrong", "right"),
+        [("calc_mode", "spectrum_type"), ("rpath", "radius")],
+    )
+    def test_common_mistakes_name_the_right_key(self, wrong, right):
+        # These two spellings appeared in this repo's own README and examples,
+        # where they silently did nothing.
+        with pytest.raises(ValueError, match=right):
+            FeffParameters(dict={"edge": "K", wrong: 6.0})
+
+    def test_every_documented_key_is_accepted(self):
+        FeffParameters(
+            dict={
+                "edge": "K",
+                "spectrum_type": "EXAFS",
+                "radius": 6.0,
+                "absorbing_atom": 0,
+                "absorbing_atoms": "Fe",
+                "exclude_hydrogen": False,
+                "s02": 0.9,
+                "nleg": 6,
+                "scf": "4.0 0 30 0.2 1",
+                "exchange": "0 0 0",
+                "control": "1 1 1 1 1 1",
+                "print": "1 0 0 0 0 3",
+                "exafs": 20,
+                "criteria": "4.0 2.5",
+                "delete_tags": ["COREHOLE"],
+            }
+        ).validate()
+
+
+class TestFeffParametersCards:
+    """to_feff_cards backs `verdi data feff export`."""
+
+    def test_includes_edge_and_rpath(self):
+        cards = FeffParameters(dict={"edge": "L3", "radius": 6.5}).to_feff_cards()
+        assert any(card.startswith("EDGE") and "L3" in card for card in cards)
+        assert any(card.startswith("RPATH") and "6.5" in card for card in cards)
+
+    def test_includes_user_cards(self):
+        cards = FeffParameters(dict={"edge": "K", "s02": 0.85}).to_feff_cards()
+        assert any(card.startswith("S02") and "0.85" in card for card in cards)
+
+    def test_deleted_cards_are_shown_as_comments_not_values(self):
+        cards = FeffParameters(dict={"edge": "K", "scf": None}).to_feff_cards()
+        assert not any(card.startswith("SCF ") for card in cards)
+        assert any(card.startswith("*") and "SCF" in card for card in cards)

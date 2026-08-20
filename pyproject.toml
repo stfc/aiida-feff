@@ -18,7 +18,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
 ]
 keywords = ["aiida", "feff", "exafs", "xas", "md-exafs", "larch", "xraylarch", "ase", "pymatgen"]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "aiida-core>=2.3,<3",
     "numpy>=1.21",
@@ -137,6 +137,10 @@ line-ending = "auto"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--strict-markers -ra"
+markers = [
+    "requires_feff: needs a real FEFF binary on PATH; skipped otherwise",
+]
 filterwarnings = [
     # AiiDA's test fixtures create a temporary config folder for each session.
     "ignore:Creating AiiDA configuration folder:UserWarning",
@@ -146,7 +150,7 @@ filterwarnings = [
 ]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false

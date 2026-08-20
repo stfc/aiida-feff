@@ -39,22 +39,23 @@ import typing as t
 
 from aiida import orm
 from aiida.engine import ToContext, WorkChain, if_
+from aiida.engine.processes.ports import PORT_NAMESPACE_SEPARATOR
 
 from aiida_feff.calcfunctions.larch import average_xas_data
 from aiida_feff.calcfunctions.path_contributions import merge_path_contributions
-from aiida_feff.calculations.feff import FeffCalculation
+from aiida_feff.calculations.feff import CONTROL_NO_POT, CONTROL_POT_ONLY, FeffCalculation
 from aiida_feff.calculations.feff_batch import FeffBatchCalculation, _snap_label
 from aiida_feff.data.parameters import FeffParameters
 from aiida_feff.data.pathcontributions import PathContributionsData
 from aiida_feff.data.xasdata import XasData
-from aiida_feff.utils import split_trajectory, structures_to_trajectory
+from aiida_feff.utils import (
+    frame_label,
+    sort_frame_labels,
+    split_trajectory,
+    structures_to_trajectory,
+)
 
 logger = logging.getLogger(__name__)
-
-# CONTROL string for the potentials-only FEFF run
-_CONTROL_POT_ONLY = "1 1 1 0 0 0"
-# CONTROL string for the paths+spectrum FEFF run using pre-computed potentials
-_CONTROL_NO_POT = "0 0 0 1 1 1"
 
 # Warn when this many absorber sites are selected (can produce huge fan-outs).
 # ponytail: matches alc-dls-exafs LARGE_NUMBER_OF_SITES; upgrade to batching if needed
@@ -322,7 +323,7 @@ class EnsembleExafsWorkChain(WorkChain):
             help=(
                 "Curved-wave amplitude threshold for storing scattering paths. "
                 "Passed through to each FeffCalculation. "
-                "Set to e.g. 5.0 to keep paths with ≥ 5%% of the peak amplitude; "
+                "Set to e.g. 5.0 to keep paths with at least 5% of the peak amplitude; "
                 "0.0 to store all paths; -1.0 (default) to skip path storage."
             ),
         )
@@ -425,20 +426,24 @@ class EnsembleExafsWorkChain(WorkChain):
             message="batch_size requires python_code to be set (used as Python runner).",
         )
 
+        # aiida-core types outline steps as ``Callable[[WorkChain], ...]``, which
+        # no subclass method can satisfy; going through an untyped alias keeps
+        # the rest of the module type-checked.
+        step: t.Any = cls
         spec.outline(
-            cls.validate_inputs,
-            if_(cls.should_precompute)(
-                cls.precompute_potentials_step,
-                cls.collect_potentials,
+            step.validate_inputs,
+            if_(step.should_precompute)(
+                step.precompute_potentials_step,
+                step.collect_potentials,
             ),
-            if_(cls.use_batch)(
-                cls.submit_batch_calculations,
-                cls.inspect_batch_results,
+            if_(step.use_batch)(
+                step.submit_batch_calculations,
+                step.inspect_batch_results,
             ).else_(
-                cls.submit_feff_calculations,
-                cls.inspect_results,
+                step.submit_feff_calculations,
+                step.inspect_results,
             ),
-            cls.average_results,
+            step.average_results,
         )
 
     # ------------------------------------------------------------------
@@ -464,15 +469,20 @@ class EnsembleExafsWorkChain(WorkChain):
             else:
                 interval = self.inputs.sample_interval.value
                 indices = list(range(0, n_steps, interval))
-                step_ids = list(traj.get_stepids())[::interval]
 
             # split_trajectory is a @calcfunction: each StructureData gets a
             # CREATE link back to the TrajectoryData in the provenance graph.
             result = split_trajectory(traj, orm.Dict({"step_ids": indices}))
-            structures: list[orm.StructureData] = [result[k] for k in sorted(result.keys())]
+            # Numeric, not lexicographic: 'frame_10' sorts before 'frame_2'
+            # as a string, which would silently reorder the trajectory.
+            structures: list[orm.StructureData] = [
+                result[k] for k in sort_frame_labels(result.keys())
+            ]
             self.report(f"Trajectory has {n_steps} frames; selected {len(structures)} snapshot(s).")
         elif "structures" in self.inputs and len(self.inputs.structures) > 0:
-            structures = [self.inputs.structures[k] for k in sorted(self.inputs.structures.keys())]
+            structures = [
+                self.inputs.structures[k] for k in sort_frame_labels(self.inputs.structures.keys())
+            ]
             # Ensure all nodes are stored before placing in ctx (checkpoint safety).
             structures = [s if s.is_stored else s.store() for s in structures]
         else:
@@ -524,7 +534,7 @@ class EnsembleExafsWorkChain(WorkChain):
             pot_structure = self.ctx.structures[-1]
 
         d = self.inputs.parameters.get_dict()
-        d["control"] = _CONTROL_POT_ONLY
+        d["control"] = CONTROL_POT_ONLY
         if "scf" in d and d["scf"] is None:
             del d["scf"]
         # Remove absorbing_atoms — each pot run uses a concrete absorbing_atom
@@ -564,16 +574,17 @@ class EnsembleExafsWorkChain(WorkChain):
     def collect_potentials(self):
         """Check each potentials run and build ctx.pot_remote[site_idx → RemoteData].
 
-        Exit codes 310 (no xmu.dat) and 311 (no chi.dat) are expected for a
-        potentials-only run — anything else is a real failure.
+        The parser recognises a potentials-only CONTROL card and returns 0 when
+        ``xmu.dat`` is legitimately absent, so only exit status 0 is accepted
+        here.  Treating 310 as acceptable — as this used to — let a genuinely
+        crashed FEFF supply the potentials for every downstream job.
         """
-        acceptable = {0, 310, 311}
         pot_remote: dict[int, orm.RemoteData] = {}
 
         for site_idx in self.ctx.site_indices:
             label = f"pot_site_{site_idx:04d}"
             child = self.ctx[label]
-            if child.exit_status not in acceptable:
+            if child.exit_status != 0:
                 self.report(
                     f"Potentials run for site {site_idx} ({child.pk}) failed "
                     f"with exit status {child.exit_status}."
@@ -602,9 +613,6 @@ class EnsembleExafsWorkChain(WorkChain):
         options = self._feff_options()
         use_precomputed = self.should_precompute() and hasattr(self.ctx, "pot_remote")
 
-        base_d = self.inputs.parameters.get_dict()
-        base_d.pop("absorbing_atoms", None)
-
         # Build ordered list of all (frame, site) pairs (same order as non-batch path)
         job_pairs: list[tuple[int, int]] = []
         for site_idx in self.ctx.site_indices:
@@ -618,8 +626,8 @@ class EnsembleExafsWorkChain(WorkChain):
         # The batch CalcJob receives frame indices into this packed trajectory, so
         # the indices stay 0..N-1 even when a trajectory input was sub-sampled.
         traj = structures_to_trajectory(
-            **{f"s{i:04d}": s for i, s in enumerate(self.ctx.structures)},
-            metadata={"call_link_label": "structures_to_trajectory_for_batch"},
+            **{frame_label(i): s for i, s in enumerate(self.ctx.structures)},
+            metadata={"call_link_label": "structures_to_trajectory_for_batch"},  # type: ignore[arg-type]
         )
 
         # Split pairs into chunks and submit one FeffBatchCalculation per chunk
@@ -682,10 +690,14 @@ class EnsembleExafsWorkChain(WorkChain):
                 n_failed += len(chunk)
                 continue
 
-            # Harvest per-pair outputs from the dynamic namespace
+            # Harvest per-pair outputs from the dynamic namespaces, reading
+            # each namespace once rather than once per pair.
+            child_xas = dynamic_outputs(child, "xas_data")
+            child_paths = dynamic_outputs(child, "path_contributions")
+
             for frame_idx, site_idx in chunk:
                 label = _snap_label(frame_idx, site_idx)
-                xas = _get_dynamic_output(child, "xas_data", label)
+                xas = child_xas.get(label)
                 if xas is None:
                     self.report(
                         f"{batch_label}: {label} has no xas_data output; counting as failed."
@@ -696,7 +708,7 @@ class EnsembleExafsWorkChain(WorkChain):
                 per_site[site_idx][label] = xas
                 all_xas[label] = xas
 
-                pc = _get_dynamic_output(child, "path_contributions", label)
+                pc = child_paths.get(label)
                 if pc is not None:
                     successful_paths[label] = pc
 
@@ -720,7 +732,7 @@ class EnsembleExafsWorkChain(WorkChain):
                 d = dict(base_d)
                 d["absorbing_atom"] = site_idx
                 if use_precomputed:
-                    d["control"] = _CONTROL_NO_POT
+                    d["control"] = CONTROL_NO_POT
                 params = FeffParameters(dict=d)
                 if use_precomputed:
                     params.label = (
@@ -857,23 +869,20 @@ class EnsembleExafsWorkChain(WorkChain):
 # ---------------------------------------------------------------------------
 
 
-def _get_dynamic_output(node, namespace: str, key: str):
-    """Retrieve a named output from a dynamic output namespace.
+def dynamic_outputs(node, namespace: str) -> dict[str, t.Any]:
+    """Return every output of *node* in a dynamic output namespace.
 
-    AiiDA exposes dynamic namespace outputs as output link labels of the form
-    ``{namespace}.{key}``.  We walk the outgoing links to find it so we do not
-    rely on attribute access (which raises on missing keys).
+    Link labels may not contain dots, so AiiDA stores a nested output port
+    ``xas_data.snap_0000`` under the label ``xas_data__snap_0000``.  Searching
+    for the dotted form — as this used to — matches nothing, which made batch
+    mode count every pair as failed.
 
-    Args:
-        node: The finished process node.
-        namespace: Name of the dynamic output namespace (e.g. ``'xas_data'``).
-        key: The specific key within the namespace (e.g. ``'snap_0000_site_0001'``).
-
-    Returns:
-        The output node, or ``None`` if not found.
+    Collecting the whole namespace once also turns a per-pair link walk,
+    O(N²) over a batch, into a single pass.
     """
-    target_label = f"{namespace}.{key}"
-    for link in node.get_outgoing().all():
-        if link.link_label == target_label:
-            return link.node
-    return None
+    prefix = f"{namespace}{PORT_NAMESPACE_SEPARATOR}"
+    return {
+        link.link_label[len(prefix) :]: link.node
+        for link in node.base.links.get_outgoing().all()
+        if link.link_label.startswith(prefix)
+    }

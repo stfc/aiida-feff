@@ -37,9 +37,12 @@ HDF5 schema (contributions_raw.h5)
     degeneracy          float64[P]
     scatterer           str[P]     variable-length UTF-8
     cw_ratio            float64[P]
+    sig2                float64[P] σ² FEFF applied to the path (Å²)
 
 P = number of paths kept after amplitude filtering
 M = number of k points in the native FEFF grid
+
+The ``files.dat`` layout parsed here is FEFF8L's; FEFF9/10 differ.
 
 Dependencies
 ------------
@@ -56,6 +59,15 @@ import sys
 from pathlib import Path
 
 import numpy as np
+
+#: Schema version written below.  Kept in step with
+#: ``aiida_feff.data.pathcontributions.H5_VERSION_SINGLE``; this script cannot
+#: import that module because it runs on the compute node without aiida-core.
+H5_FORMAT_VERSION = 1
+
+#: cw_ratio recorded for a path that ``files.dat`` does not list.  Treated as
+#: "unknown, keep it" by both the amplitude filter and the writer.
+MISSING_CW_RATIO = 100.0
 
 
 def _parse_files_dat(text: str) -> dict[str, dict]:
@@ -103,7 +115,8 @@ def _parse_with_larch(fpath: Path) -> dict:
 
     try:
         dat = FeffDatFile(filename=str(fpath))
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 — larch raises bare Exception subclasses
+        print(f"WARNING: larch could not read {fpath.name}: {exc}", file=sys.stderr)
         return {}
 
     if dat.k is None or len(dat.k) == 0:
@@ -129,12 +142,14 @@ def _parse_with_larch(fpath: Path) -> dict:
         scat = [g[0] for g in dat.geom if int(g[2]) != 0]
         if scat:
             scatterer = "-".join(scat)
-    except Exception:
-        pass
+    except (AttributeError, IndexError, TypeError, ValueError) as exc:
+        # "?" propagates into the merge path_key, so say why it happened.
+        print(f"WARNING: could not read geometry of {fpath.name}: {exc}", file=sys.stderr)
 
     try:
         path_idx = int(fpath.stem.replace("feff", ""))
     except ValueError:
+        print(f"WARNING: unexpected path filename {fpath.name}; path_idx set to 0", file=sys.stderr)
         path_idx = 0
 
     return {
@@ -153,8 +168,8 @@ def _parse_with_text(fpath: Path) -> dict:
     import io
 
     try:
-        lines = fpath.read_text().splitlines()
-    except (OSError, FileNotFoundError):
+        lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
         return {}
     path_idx = 0
     nlegs = 0
@@ -257,7 +272,7 @@ def main() -> None:
     files_dat = cwd / "files.dat"
     amplitude_map: dict[str, dict] = {}
     if files_dat.exists():
-        amplitude_map = _parse_files_dat(files_dat.read_text())
+        amplitude_map = _parse_files_dat(files_dat.read_text(encoding="utf-8", errors="replace"))
     else:
         print("WARNING: files.dat not found; amplitude filtering disabled.", file=sys.stderr)
 
@@ -270,8 +285,14 @@ def main() -> None:
         sys.exit(0)
 
     if amplitude_map:
+        # A path absent from files.dat has no measured amplitude.  Keep it —
+        # dropping data FEFF wrote is worse than storing a weak path — and use
+        # the same MISSING_CW_RATIO sentinel when recording it below, so the
+        # filter and the record agree about what "unknown" means.
         qualifying = [
-            f for f in all_dat if amplitude_map.get(f.name, {}).get("cw_ratio", 100.0) >= threshold
+            f
+            for f in all_dat
+            if amplitude_map.get(f.name, {}).get("cw_ratio", MISSING_CW_RATIO) >= threshold
         ]
         print(
             f"Path amplitude filter (threshold={threshold}%): "
@@ -307,7 +328,9 @@ def main() -> None:
 
     paths = []
     for fpath in qualifying:
-        cw_ratio = amplitude_map.get(fpath.name, {}).get("cw_ratio", 0.0)
+        entry = amplitude_map.get(fpath.name, {})
+        cw_ratio = entry.get("cw_ratio", MISSING_CW_RATIO)
+        sig2 = entry.get("sig2", 0.0)
         parsed: dict = {}
         if larch_ok:
             parsed = _parse_with_larch(fpath)
@@ -319,6 +342,7 @@ def main() -> None:
             print(f"WARNING: could not parse {fpath.name}; skipping.", file=sys.stderr)
             continue
         parsed["cw_ratio"] = cw_ratio
+        parsed["sig2"] = sig2
         paths.append(parsed)
 
     if not paths:
@@ -331,16 +355,33 @@ def main() -> None:
     _COMPRESS = {"compression": "gzip", "compression_opts": 6}
 
     k_grid_params = np.asarray(paths[0]["k"], dtype=np.float64)
-    n_paths = len(paths)
     m_k = len(k_grid_params)
 
+    # All paths from one FEFF run share its k grid.  A mismatch means the
+    # files came from different runs; packing them into one array would
+    # silently truncate or broadcast-fail, so drop the odd ones out loudly.
+    consistent = []
+    for p in paths:
+        if len(np.asarray(p["k"])) == m_k:
+            consistent.append(p)
+        else:
+            print(
+                f"WARNING: path {p.get('path_idx')} has {len(p['k'])} k points, "
+                f"expected {m_k}; skipping it.",
+                file=sys.stderr,
+            )
+    paths = consistent
+    if not paths:
+        print("No paths share a common k grid; contributions_raw.h5 not written.", file=sys.stderr)
+        sys.exit(0)
+
+    n_paths = len(paths)
     feff_data_columns = 6
     feff_data_arr = np.zeros((n_paths, m_k, feff_data_columns), dtype=np.float64)
-    r_eff_arr = np.zeros(n_paths, dtype=np.float64)
     nlegs_arr = np.zeros(n_paths, dtype=np.int32)
-    degeneracy_arr = np.zeros(n_paths, dtype=np.float64)
+    scalar_names = ("r_eff", "degeneracy", "cw_ratio", "sig2")
+    scalars = {name: np.zeros(n_paths, dtype=np.float64) for name in scalar_names}
     scatterer_list: list[str] = []
-    cw_ratio_arr = np.zeros(n_paths, dtype=np.float64)
 
     for idx, p in enumerate(paths):
         fd = np.asarray(p["feff_data"], dtype=np.float64)
@@ -349,16 +390,15 @@ def main() -> None:
             feff_data_arr[idx] = fd[:m_k, :feff_data_columns]
         else:
             feff_data_arr[idx, :, : fd.shape[1]] = fd[:m_k]
-        r_eff_arr[idx] = float(p["r_eff"])
+        for name in scalar_names:
+            scalars[name][idx] = float(p[name])
         nlegs_arr[idx] = int(p["nlegs"])
-        degeneracy_arr[idx] = float(p["degeneracy"])
         scatterer_list.append(str(p["scatterer"]))
-        cw_ratio_arr[idx] = float(p["cw_ratio"])
 
     out_path = cwd / "contributions_raw.h5"
     with h5py.File(out_path, "w") as hf:
         meta = hf.create_group("meta")
-        meta.attrs["format_version"] = 1
+        meta.attrs["format_version"] = H5_FORMAT_VERSION
         meta.attrs["frame_idx"] = frame_idx
         meta.attrs["site_idx"] = site_idx
         meta.attrs["absorber_element"] = absorber_element
@@ -367,16 +407,15 @@ def main() -> None:
         pg = hf.create_group("paths")
         pg.create_dataset("k_grid_params", data=k_grid_params, **_COMPRESS)
         pg.create_dataset("feff_data", data=feff_data_arr, **_COMPRESS)
-        pg.create_dataset("r_eff", data=r_eff_arr, **_COMPRESS)
         pg.create_dataset("nlegs", data=nlegs_arr, **_COMPRESS)
-        pg.create_dataset("degeneracy", data=degeneracy_arr, **_COMPRESS)
+        for name in scalar_names:
+            pg.create_dataset(name, data=scalars[name], **_COMPRESS)
         dt_str = h5py.string_dtype(encoding="utf-8")
         pg.create_dataset(
             "scatterer",
             data=np.array(scatterer_list, dtype=dt_str),
             **_COMPRESS,
         )
-        pg.create_dataset("cw_ratio", data=cw_ratio_arr, **_COMPRESS)
 
     print(f"Wrote {n_paths} paths to {out_path}", file=sys.stderr)
 

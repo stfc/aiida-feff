@@ -21,8 +21,6 @@ import click
 from aiida import load_profile, orm
 from aiida.engine import run_get_node, submit
 
-load_profile()
-
 
 def get_structure_bcc_fe(a: float = 2.87) -> orm.StructureData:
     """BCC iron unit cell (2 atoms)."""
@@ -43,6 +41,10 @@ def get_structure_bcc_fe(a: float = 2.87) -> orm.StructureData:
     help="Submit to daemon instead of running inline.",
 )
 def main(code, do_submit):
+    # Loading the profile here rather than at import keeps --help usable
+    # on a machine with no AiiDA profile configured.
+    load_profile()
+
     from aiida_feff.calculations.feff import FeffCalculation
     from aiida_feff.data.parameters import FeffParameters
 
@@ -52,16 +54,13 @@ def main(code, do_submit):
 
     params = FeffParameters(
         dict={
-            "title": "BCC Fe K-edge EXAFS example",
             "edge": "K",
-            "calc_mode": "EXAFS",
+            "spectrum_type": "EXAFS",
             "s02": 1.0,
-            "rpath": 5.5,
+            "radius": 5.5,
             "nleg": 4,
-            "scf_radius": 4.0,
-            "fms_radius": 6.0,
-            "kmin": 0.0,
-            "kmax": 20.0,
+            "scf": "4.0 0 30 0.2 1",
+            "exafs": 20,
         }
     )
 

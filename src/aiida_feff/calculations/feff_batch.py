@@ -32,6 +32,7 @@ from aiida.common import CalcInfo, CodeInfo, datastructures
 from aiida.engine import CalcJob, CalcJobProcessSpec
 
 from aiida_feff.calculations.feff import (
+    CONTROL_NO_POT,
     FEFF_AGGREGATE_SCRIPT,
     FEFF_CHI_FILE,
     FEFF_FILES_DAT,
@@ -39,6 +40,8 @@ from aiida_feff.calculations.feff import (
     FEFF_POTENTIAL_FILES,
     FEFF_XMUDA_FILE,
     FeffCalculation,
+    absorber_element,
+    as_lf_bytes,
 )
 from aiida_feff.data.parameters import FeffParameters
 
@@ -54,9 +57,6 @@ BATCH_CONFIG = "batch_config.json"
 BATCH_LOG = "batch.log"
 BATCH_ERR = "batch_err.log"
 
-# CONTROL strings (same as ensemble workflow)
-_CONTROL_NO_POT = "0 0 0 1 1 1"
-
 # Retrieve glob patterns for per-run outputs (depth=None preserves directory structure)
 _SNAP_RETRIEVE = [
     (f"snap_*/{FEFF_XMUDA_FILE}", ".", None),
@@ -68,8 +68,12 @@ _SNAP_RETRIEVE = [
     (BATCH_LOG, ".", 0),
     (BATCH_ERR, ".", 0),
 ]
-_SNAP_RETRIEVE_PATHS = [("snap_*/_feff_aggregate_config.json", ".", None)]
 _CONTRIBUTIONS_GLOB = ("snap_*/contributions_raw.h5", ".", None)
+
+# Fraction of the job's wallclock a single FEFF run may consume before the
+# driver kills it.  Without a bound one hung run holds a worker until the
+# scheduler kills the job, losing every result in the chunk.
+_RUN_TIMEOUT_FRACTION = 0.9
 
 
 class FeffBatchCalculation(CalcJob):
@@ -105,8 +109,9 @@ class FeffBatchCalculation(CalcJob):
         Curved-wave amplitude threshold for path aggregation.  Values ≥ 0
         trigger ``_aggregate_paths.py`` after each FEFF run.
     n_workers : :class:`~aiida.orm.Int`, optional
-        Number of parallel workers.  Defaults to ``SLURM_CPUS_ON_NODE``
-        (falling back to ``SLURM_NTASKS``, then 1).
+        Number of parallel workers.  Defaults to the core count implied by
+        ``metadata.options.resources``, which works on every scheduler; the
+        driver only consults the environment if that is unavailable.
 
     Outputs
     -------
@@ -150,7 +155,7 @@ class FeffBatchCalculation(CalcJob):
             "n_workers",
             valid_type=orm.Int,
             required=False,
-            help="Parallel workers; defaults to SLURM_CPUS_ON_NODE at runtime.",
+            help="Parallel workers; defaults to the core count in metadata.options.resources.",
         )
 
         spec.inputs["metadata"]["options"]["parser_name"].default = "feff.feff_batch"  # type: ignore[index]
@@ -170,13 +175,56 @@ class FeffBatchCalculation(CalcJob):
             help="PathContributionsData nodes keyed snap_FFFF_site_SSSS.",
         )
 
-        spec.exit_code(300, "ERROR_INVALID_INPUT", message="Input validation failed: {reason}.")
         spec.exit_code(400, "ERROR_PARSING_FAILED", message="Batch parser raised: {reason}.")
         spec.exit_code(
             301,
             "ERROR_ALL_RUNS_FAILED",
             message="Driver produced no xmu.dat outputs.",
         )
+
+        spec.inputs.validator = cls._validate_inputs  # type: ignore[assignment]
+
+    @staticmethod
+    def _validate_inputs(value, _port_namespace) -> str | None:
+        """Reject inputs the driver could not act on.
+
+        ``prepare_for_submission`` cannot return an exit code, so pairing and
+        range checks happen here, before the node exists.
+        """
+        if value is None:
+            return None
+
+        frames = value.get("frame_indices")
+        sites = value.get("site_indices")
+        if frames is None or sites is None:
+            return None
+
+        frame_list = frames.get_list()
+        site_list = sites.get_list()
+        problems: list[str] = []
+
+        if len(frame_list) != len(site_list):
+            problems.append(
+                f"frame_indices ({len(frame_list)}) and site_indices ({len(site_list)}) "
+                "must have the same length: they are parallel lists of (frame, site) pairs."
+            )
+        if not frame_list:
+            problems.append("frame_indices must not be empty.")
+
+        trajectory = value.get("trajectory")
+        if trajectory is not None and frame_list:
+            n_steps = len(trajectory.get_array("positions"))
+            out_of_range = sorted({f for f in frame_list if not 0 <= f < n_steps})
+            if out_of_range:
+                problems.append(
+                    f"frame_indices {out_of_range} are outside the trajectory (0–{n_steps - 1})."
+                )
+
+        n_workers = value.get("n_workers")
+        if n_workers is not None and n_workers.value < 1:
+            problems.append(f"n_workers must be >= 1, got {n_workers.value}.")
+
+        return " ".join(problems) or None
 
     # ------------------------------------------------------------------
 
@@ -186,10 +234,6 @@ class FeffBatchCalculation(CalcJob):
 
         frame_indices: list[int] = self.inputs.frame_indices.get_list()
         site_indices: list[int] = self.inputs.site_indices.get_list()
-        if len(frame_indices) != len(site_indices):
-            return self.exit_codes.ERROR_INVALID_INPUT.format(  # type: ignore[no-any-return]
-                reason="frame_indices and site_indices must have the same length"
-            )
 
         use_precomputed = "remote_potentials" in self.inputs
         threshold = self.inputs.path_cw_threshold.value
@@ -209,8 +253,12 @@ class FeffBatchCalculation(CalcJob):
         # ----------------------------------------------------------------
         base_d = self.inputs.parameters.get_dict()
         base_d.pop("absorbing_atoms", None)
+        # Mirror the normalisation the non-batch path applies, so both produce
+        # the same feff.inp from the same parameters.
+        if "scf" in base_d and base_d["scf"] is None:
+            del base_d["scf"]
         if use_precomputed:
-            base_d["control"] = _CONTROL_NO_POT
+            base_d["control"] = CONTROL_NO_POT
 
         for frame_idx, site_idx in zip(frame_indices, site_indices, strict=True):
             run_label = _snap_label(frame_idx, site_idx)
@@ -225,27 +273,19 @@ class FeffBatchCalculation(CalcJob):
             # _feff_aggregate_config.json into it.
             snap_folder = folder.get_subfolder(run_label, create=True)
 
-            inp_text = FeffCalculation._build_feff_inp(structure, params)
-            with snap_folder.open("feff.inp", "w") as fh:
-                fh.write(inp_text)
+            inp_text = FeffCalculation.build_feff_inp(structure, params)
+            with snap_folder.open("feff.inp", "wb") as fh:
+                fh.write(as_lf_bytes(inp_text))
 
             if do_aggregate:
-                # Compute absorber element for aggregate config
-                try:
-                    site = structure.sites[site_idx]
-                    kind = structure.get_kind(site.kind_name)
-                    absorber_element = str(kind.symbols[0])
-                except Exception:  # noqa: BLE001
-                    absorber_element = ""
-
                 agg_cfg = {
                     "threshold": float(threshold),
                     "frame_idx": frame_idx,
                     "site_idx": site_idx,
-                    "absorber_element": absorber_element,
+                    "absorber_element": absorber_element(structure, site_idx),
                 }
-                with snap_folder.open("_feff_aggregate_config.json", "w") as fh:
-                    json.dump(agg_cfg, fh)
+                with snap_folder.open("_feff_aggregate_config.json", "wb") as fh:
+                    fh.write(as_lf_bytes(json.dumps(agg_cfg)))
 
         # ----------------------------------------------------------------
         # FEFF executable info — read from feff_code at submission time
@@ -255,22 +295,25 @@ class FeffBatchCalculation(CalcJob):
         feff_code = self.inputs.feff_code
         try:
             feff_exe = str(feff_code.filepath_executable)
-        except AttributeError:
-            # ponytail: assumes InstalledCode; other types need extension
-            feff_exe = feff_code.label
-            logger.warning(
-                "feff_code has no filepath_executable; using label %r as executable name",
-                feff_exe,
-            )
+        except AttributeError as exc:
+            # Falling back to the label would put a non-executable name into
+            # every wrapper script and fail hours later, one stderr.txt per
+            # snapshot deep.  Refuse now instead.
+            raise ValueError(
+                f"feff_code {feff_code!r} has no filepath_executable. Batch mode drives "
+                "FEFF through a shell wrapper and needs a concrete path, so the FEFF "
+                "code must be an InstalledCode."
+            ) from exc
         feff_prepend = getattr(feff_code, "prepend_text", "") or ""
         feff_append = getattr(feff_code, "append_text", "") or ""
 
         # ----------------------------------------------------------------
         # Write batch_config.json
         # ----------------------------------------------------------------
-        n_workers_val: int | None = None
         if "n_workers" in self.inputs:
             n_workers_val = self.inputs.n_workers.value
+        else:
+            n_workers_val = workers_from_resources(self.options.resources)
 
         batch_cfg = {
             "pairs": list(zip(frame_indices, site_indices, strict=True)),
@@ -280,9 +323,10 @@ class FeffBatchCalculation(CalcJob):
             "n_workers": n_workers_val,
             "do_aggregate": do_aggregate,
             "threshold": float(threshold),
+            "run_timeout_seconds": self._run_timeout(),
         }
-        with folder.open(BATCH_CONFIG, "w") as fh:
-            json.dump(batch_cfg, fh, indent=2)
+        with folder.open(BATCH_CONFIG, "wb") as fh:
+            fh.write(as_lf_bytes(json.dumps(batch_cfg, indent=2)))
 
         # ----------------------------------------------------------------
         # Write driver and aggregation scripts
@@ -323,14 +367,27 @@ class FeffBatchCalculation(CalcJob):
                     )
 
         # retrieve_list: glob each snap_* subdir for output files
-        retrieve_list = list(_SNAP_RETRIEVE)
+        retrieve_list: list[tuple[str, str, int | None]] = list(_SNAP_RETRIEVE)
         if do_aggregate:
             retrieve_list.append(_CONTRIBUTIONS_GLOB)
 
-        calcinfo.retrieve_list = retrieve_list
+        # CalcInfo.retrieve_list is annotated for the flat (name, dest, depth=str)
+        # form; batch mode needs the depth=None variant that keeps snap_*/ nesting.
+        calcinfo.retrieve_list = retrieve_list  # type: ignore[assignment]
         calcinfo.local_copy_list = []
 
         return calcinfo
+
+    def _run_timeout(self) -> float | None:
+        """Per-FEFF-run timeout in seconds, or ``None`` when unbounded.
+
+        Derived from the job's own wallclock so a hung run is killed while
+        there is still time to retrieve everything else in the chunk.
+        """
+        wallclock = self.options.get("max_wallclock_seconds")
+        if not wallclock:
+            return None
+        return float(wallclock) * _RUN_TIMEOUT_FRACTION
 
 
 # ---------------------------------------------------------------------------
@@ -341,3 +398,27 @@ class FeffBatchCalculation(CalcJob):
 def _snap_label(frame_idx: int, site_idx: int) -> str:
     """Canonical label for a (frame, site) pair, shared with the parser."""
     return f"snap_{frame_idx:04d}_site_{site_idx:04d}"
+
+
+def workers_from_resources(resources: dict | None) -> int:
+    """Derive a parallel-worker count from AiiDA's scheduler resources.
+
+    ``metadata.options.resources`` is the one description of the allocation
+    that every scheduler fills in, so it is a better default than reading
+    ``SLURM_*`` from the environment — which silently yields one worker on
+    PBS, LSF and ``core.direct``.
+
+    Returns at least 1.
+    """
+    if not resources:
+        return 1
+    machines = int(resources.get("num_machines", 1) or 1)
+    per_machine = resources.get("num_mpiprocs_per_machine") or resources.get(
+        "num_cores_per_machine"
+    )
+    if per_machine:
+        return max(1, machines * int(per_machine))
+    total = resources.get("tot_num_mpiprocs") or resources.get("num_cores_per_mpiproc")
+    if total:
+        return max(1, int(total))
+    return max(1, machines)

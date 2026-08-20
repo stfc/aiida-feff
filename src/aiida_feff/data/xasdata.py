@@ -12,7 +12,8 @@ class XasData(ArrayData):
     Arrays stored
     -------------
     energy : (N,) float
-        Absolute energy grid in eV.
+        Energy grid in eV **relative to E0** — this is FEFF's ``omega`` column
+        from ``xmu.dat``.  Add :attr:`e0` to obtain absolute energies.
     mu : (N,) float
         Total absorption μ(E) (from ``xmu.dat``).
     mu0 : (N,) float
@@ -29,13 +30,19 @@ class XasData(ArrayData):
     chir_re  : (P,) float
     chir_im  : (P,) float
 
-    Metadata stored in :attr:`extras`
-    -----------------------------------
-    edge : str
-    e0 : float  — threshold energy in eV
+    Metadata stored in node **attributes**
+    ---------------------------------------
+    Attributes rather than extras: extras stay mutable after storage and are
+    excluded from the node hash, so scientific metadata kept there can be
+    rewritten on a stored node and makes caching treat physically different
+    nodes as identical.
+
+    e0 : float  — threshold energy in eV (absolute)
     source_file : str  — original filename tag
-    fourier_params : dict  — FT parameters used (kmin, kmax, kweight, …)
+    fourier_params : dict  — FT parameters used (kmin, kmax, kweight, window, …)
     n_snapshots : int  — number of ensemble members (averaged nodes only)
+    code_versions : dict  — versions of larch / pymatgen / … that produced this
+    feff_version : str  — FEFF banner parsed from ``log.dat``
 
     Usage::
 
@@ -64,7 +71,7 @@ class XasData(ArrayData):
         self.set_array("mu", np.asarray(mu, dtype=float))
         if mu0 is not None:
             self.set_array("mu0", np.asarray(mu0, dtype=float))
-        self.base.extras.set("e0", float(e0))
+        self.base.attributes.set("e0", float(e0))
 
     def set_chi(self, k: np.ndarray, chi_k: np.ndarray) -> None:
         """Store χ(k) data from ``chi.dat``."""
@@ -77,8 +84,13 @@ class XasData(ArrayData):
 
     @property
     def energy(self) -> np.ndarray:
-        """Energy grid in eV."""
+        """Energy grid in eV, relative to :attr:`e0`."""
         return self.get_array("energy")
+
+    @property
+    def absolute_energy(self) -> np.ndarray:
+        """Energy grid in eV on an absolute scale (``energy + e0``)."""
+        return self.get_array("energy") + self.e0
 
     @property
     def mu(self) -> np.ndarray:
@@ -97,5 +109,5 @@ class XasData(ArrayData):
 
     @property
     def e0(self) -> float:
-        """Edge threshold energy in eV."""
-        return float(self.base.extras.get("e0", 0.0))
+        """Edge threshold energy in eV (absolute)."""
+        return float(self.base.attributes.get("e0", 0.0))

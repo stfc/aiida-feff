@@ -22,8 +22,6 @@ import click
 from aiida import load_profile, orm
 from aiida.engine import submit
 
-load_profile()
-
 
 @click.command()
 @click.option("--code", required=True, help="Code label for FEFF")
@@ -41,10 +39,13 @@ load_profile()
     help="Use every N-th snapshot to reduce the number of FEFF jobs.",
 )
 @click.option("--edge", default="K", show_default=True)
-@click.option("--rpath", default=5.5, show_default=True, type=float)
-def main(code, traj_pk, step_every, edge, rpath):
+@click.option("--radius", default=5.5, show_default=True, type=float)
+def main(code, traj_pk, step_every, edge, radius):
+    # Loading the profile here rather than at import keeps --help usable
+    # on a machine with no AiiDA profile configured.
+    load_profile()
+
     from aiida_feff.data.parameters import FeffParameters
-    from aiida_feff.utils import trajectory_to_structures
     from aiida_feff.workflows.ensemble import EnsembleExafsWorkChain
 
     code_node = orm.load_code(code)
@@ -52,28 +53,29 @@ def main(code, traj_pk, step_every, edge, rpath):
 
     click.echo(f"Loaded trajectory pk={traj_pk}: {len(trajectory.get_array('positions'))} steps")
 
-    # Convert to StructureData list (every N-th frame)
     n_steps = len(trajectory.get_array("positions"))
-    step_ids = list(range(0, n_steps, step_every))
-    structures = trajectory_to_structures(trajectory, step_ids=step_ids, store=True)
-    click.echo(f"Using {len(structures)} snapshots (step_every={step_every})")
+    click.echo(f"Using every {step_every} of {n_steps} frames")
 
     params = FeffParameters(
         dict={
             "edge": edge,
-            "calc_mode": "EXAFS",
-            "rpath": rpath,
+            "spectrum_type": "EXAFS",
+            "radius": radius,
             "s02": 1.0,
             "nleg": 4,
         }
     )
     params.store()
 
+    # Pass the trajectory itself, not a pre-split list of structures: the
+    # workchain splits it with the split_trajectory calcfunction, so every
+    # snapshot keeps a CREATE link back to the trajectory.  Splitting outside
+    # the workchain severs that link and the provenance graph with it.
     inputs = {
-        "structures": {f"frame_{i:04d}": s for i, s in enumerate(structures)},
+        "trajectory": trajectory,
+        "sample_interval": orm.Int(step_every),
         "parameters": params,
         "code": code_node,
-        "max_iterations": orm.Int(3),
         "options": orm.Dict(
             {
                 "resources": {"num_machines": 1, "num_mpiprocs_per_machine": 1},

@@ -64,9 +64,14 @@ class TestMaxSafeMicCutoff:
 
 
 class TestMsrdNonOrthogonalCell:
+    # Triclinic, and large enough that a 4 A cutoff stays inside the
+    # inscribed sphere (5.28 A): the point of these tests is that find_mic
+    # agrees with ASE, not that aliasing is tolerable.
+    CELL = np.array([[12.0, 4.0, 2.0], [2.0, 12.0, 4.0], [4.0, 2.0, 12.0]])
+
     def _make_trajectory(self, n_frames=10, seed=42):
-        """Return raw positions array and reference ASE distances."""
-        cell = np.array([[3.0, 1.0, 0.5], [0.5, 3.0, 1.0], [1.0, 0.5, 3.0]])
+        """Return raw positions plus reference distances and angles from ASE."""
+        cell = self.CELL
         symbols = ["Mn", "O", "O"]
         base = np.array([[0.0, 0.0, 0.0], [1.5, 1.0, 0.8], [-1.0, 1.5, 1.2]])
         rng = np.random.default_rng(seed)
@@ -77,11 +82,9 @@ class TestMsrdNonOrthogonalCell:
             atoms = Atoms(symbols, positions=pos, cell=cell, pbc=True)
             ref_d_01.append(atoms.get_distance(0, 1, mic=True))
             ref_d_02.append(atoms.get_distance(0, 2, mic=True))
-            v01 = atoms.get_distances(0, [1], mic=True, vector=True)[0]
-            v12 = atoms.get_distances(1, [2], mic=True, vector=True)[0]
-            v1, v2 = -v01, v12
-            cos_t = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-            ref_angles.append(np.degrees(np.arccos(np.clip(cos_t, -1.0, 1.0))))
+            # ASE's own angle at atom 1, an oracle independent of the
+            # vector algebra under test.
+            ref_angles.append(atoms.get_angle(0, 1, 2, mic=True))
 
         return cell, symbols, positions, ref_d_01, ref_d_02, ref_angles
 
@@ -166,30 +169,44 @@ class TestMsrdNonOrthogonalCell:
 
 
 class TestCutoffSafetyWarnings:
-    def test_warns_when_cutoff_exceeds_safe_radius(self, caplog):
+    UNSAFE_CELL = np.diag([2.0, 2.0, 2.0])  # safe radius = 1.0 Å
+    POSITIONS = np.array(
+        [
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        ]
+    )
+
+    def test_raises_when_cutoff_exceeds_safe_radius(self):
         from aiida_feff.calcfunctions.debye_waller import _calculate_grouped_msrd_impl
 
-        cell = np.diag([2.0, 2.0, 2.0])  # safe radius = 1.0 Å
-        positions = np.array(
-            [
-                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-            ]
-        )
-        symbols = ["Mn", "Mn"]
-
-        with caplog.at_level("WARNING", logger="aiida_feff.calcfunctions.debye_waller"):
+        with pytest.raises(ValueError, match="minimum-image cutoff"):
             _calculate_grouped_msrd_impl(
-                positions,
-                symbols,
-                cell,
+                self.POSITIONS,
+                ["Mn", "Mn"],
+                self.UNSAFE_CELL,
                 [True, True, True],
                 [0],
                 cutoff=1.5,
                 cutoff_3body=None,
             )
 
-        assert any("exceeds the maximum safe MIC cutoff" in r.message for r in caplog.records)
+    def test_override_downgrades_the_error_to_a_warning(self, caplog):
+        from aiida_feff.calcfunctions.debye_waller import _calculate_grouped_msrd_impl
+
+        with caplog.at_level("WARNING", logger="aiida_feff.calcfunctions.debye_waller"):
+            _calculate_grouped_msrd_impl(
+                self.POSITIONS,
+                ["Mn", "Mn"],
+                self.UNSAFE_CELL,
+                [True, True, True],
+                [0],
+                cutoff=1.5,
+                cutoff_3body=None,
+                allow_unsafe_cutoff=True,
+            )
+
+        assert any("minimum-image cutoff" in r.message for r in caplog.records)
 
     def test_no_warning_for_safe_cutoff(self, caplog):
         from aiida_feff.calcfunctions.debye_waller import _calculate_grouped_msrd_impl
@@ -214,5 +231,5 @@ class TestCutoffSafetyWarnings:
                 cutoff_3body=None,
             )
 
-        cutoff_warns = [r for r in caplog.records if "maximum safe MIC cutoff" in r.message]
+        cutoff_warns = [r for r in caplog.records if "minimum-image cutoff" in r.message]
         assert len(cutoff_warns) == 0

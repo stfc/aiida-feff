@@ -80,8 +80,8 @@ structure.append_atom(position=(1.435,1.435,1.435), symbols='Fe')
 
 params = FeffParameters(dict={
     "edge": "K",
-    "calc_mode": "EXAFS",
-    "rpath": 5.5,
+    "spectrum_type": "EXAFS",
+    "radius": 5.5,           # FEFF RPATH / cluster radius in Å
     "s02": 1.0,
 })
 
@@ -237,8 +237,8 @@ load_profile()
 
 params = FeffParameters(dict={
     "edge": "K",
-    "calc_mode": "EXAFS",
-    "rpath": 6.0,
+    "spectrum_type": "EXAFS",
+    "radius": 6.0,
     "absorbing_atoms": "Cu",   # all Cu sites; or e.g. "Cu:0,1" for a subset
 })
 
@@ -342,6 +342,7 @@ from aiida.orm import Dict
 
 # Fourier transform (provenance-tracked)
 chir = chi_k_to_r(xas_data=xas, ft_params=Dict({"kmin":3, "kmax":14, "kweight":2}))
+# Defaults, including window="kaiser", are in aiida_feff.calcfunctions.larch.FT_DEFAULTS.
 ```
 
 ### 6. Plotting (optional)
@@ -385,8 +386,14 @@ params = {
     "cutoff": 3.5,           # neighbour search radius in Å
     "cutoff_3body": 3.0,     # include 3-body paths (omit to skip)
     "skip_frames": 50,       # discard first N frames (equilibration)
-    "align": True,           # two-pass Kabsch alignment before MSRD
 }
+
+# `cutoff` must stay below the inscribed-sphere radius of the cell, or the
+# minimum-image convention picks the wrong neighbour and biases σ² low.
+# compute_msrd raises rather than returning a quietly wrong number; build a
+# supercell, or pass allow_unsafe_cutoff=True if you accept the bias.
+# There is no `align` key: MSRD is computed from raw coordinates, because
+# Kabsch alignment rotates the frame away from the cell used for the MIC.
 
 # Interactive exploration — no DB writes:
 result = compute_msrd(traj_node, params)

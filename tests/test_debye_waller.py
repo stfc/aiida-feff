@@ -1,11 +1,18 @@
 """Tests for the Debye-Waller / MSRD calcfunctions.
 
-Pure helper functions are tested directly (no AiiDA profile needed).
-Calcfunction tests use the ``aiida_profile`` fixture from aiida-core.
+Every test in this repository loads a temporary AiiDA profile: aiida-core's
+pytest plugin installs it session-scoped and autouse.  The backend is
+``core.sqlite_dos``, so no PostgreSQL and no daemon are involved.
+
+Distance-based tests use a 2x2x2 BCC supercell whose inscribed-sphere radius
+(2.77 Angstrom) exceeds the cutoffs they pass.  Raise ``reps`` rather than the
+cutoff if a test needs a longer range.
 """
 
 import numpy as np
 import pytest
+
+from tests.conftest import BCC_FE_NN, bcc_supercell_positions
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -147,167 +154,238 @@ class TestKabschAlign:
         assert result.shape == pos.shape
 
 
-# ---------------------------------------------------------------------------
-# Calcfunctions (require AiiDA profile)
-# ---------------------------------------------------------------------------
+class TestClusterByTolerance:
+    """Cluster width must stay bounded by the tolerance the caller asked for."""
+
+    def test_ladder_does_not_chain_beyond_tolerance(self):
+        from aiida_feff.calcfunctions.debye_waller import _cluster_by_tolerance
+
+        # Consecutive gaps of 0.08 < tol, but the full span is 0.32 > tol.
+        items = [{"d": d} for d in (2.00, 2.08, 2.16, 2.24, 2.32)]
+        clusters = _cluster_by_tolerance(items, "d", tol=0.1)
+        for cluster in clusters:
+            span = cluster[-1]["d"] - cluster[0]["d"]
+            assert span <= 0.1 + 1e-12, f"cluster spans {span:.3f} Å, wider than tol=0.1"
+        assert len(clusters) > 1
+
+    def test_empty_input_yields_no_clusters(self):
+        from aiida_feff.calcfunctions.debye_waller import _cluster_by_tolerance
+
+        assert _cluster_by_tolerance([], "d", tol=0.1) == []
 
 
-class TestComputeMsrd:
-    """Tests for the store_msrd calcfunction."""
+class TestMicCutoffGuard:
+    """A cutoff beyond the inscribed sphere biases every distance downward."""
 
-    def test_returns_dict_node(self, generate_trajectory, aiida_profile):
+    def test_unsafe_cutoff_raises(self, generate_trajectory, aiida_profile):
         from aiida.orm import Dict
 
         from aiida_feff.calcfunctions.debye_waller import store_msrd
 
-        traj = generate_trajectory(n_frames=30, n_atoms=2, sigma=0.05, seed=0)
+        # reps=1 gives a 2.77 Å cell, safe only to 1.435 Å.
+        traj = generate_trajectory(n_frames=10, reps=1, sigma=0.02, seed=0)
         params = Dict({"absorber_site": "Fe", "cutoff": 3.5})
-        result = store_msrd(trajectory=traj, params=params)
-        assert isinstance(result, Dict)
+        with pytest.raises(ValueError, match="minimum-image cutoff"):
+            store_msrd(trajectory=traj, params=params)
+
+    def test_override_permits_unsafe_cutoff(self, generate_trajectory, aiida_profile):
+        from aiida.orm import Dict
+
+        from aiida_feff.calcfunctions.debye_waller import store_msrd
+
+        traj = generate_trajectory(n_frames=10, reps=1, sigma=0.02, seed=0)
+        params = Dict({"absorber_site": "Fe", "cutoff": 3.5, "allow_unsafe_cutoff": True})
+        assert len(store_msrd(trajectory=traj, params=params).get_dict()) > 0
+
+    def test_unsafe_cutoff_would_have_biased_sigma2_low(self):
+        """The guard is worth having: show the size of the error it prevents."""
+        from aiida_feff.calcfunctions.debye_waller import _calculate_grouped_msrd_impl
+
+        sigma = 0.05
+        rng = np.random.default_rng(0)
+
+        def first_shell_sigma2(reps, cutoff, allow_unsafe):
+            eq, cell = bcc_supercell_positions(reps)
+            pos = eq[None] + rng.normal(scale=sigma, size=(2000, len(eq), 3))
+            res2, _ = _calculate_grouped_msrd_impl(
+                pos,
+                ["Fe"] * len(eq),
+                cell,
+                [True] * 3,
+                [0],
+                cutoff=cutoff,
+                allow_unsafe_cutoff=allow_unsafe,
+            )
+            return res2[0]["sigma2"]
+
+        safe = first_shell_sigma2(reps=2, cutoff=2.7, allow_unsafe=False)
+        unsafe = first_shell_sigma2(reps=1, cutoff=2.7, allow_unsafe=True)
+        assert safe == pytest.approx(2 * sigma**2, rel=0.05)
+        assert unsafe < 0.5 * safe, "expected the aliased cutoff to collapse sigma2"
+
+
+class TestMsrdAnalyticLimits:
+    """Uncorrelated Gaussian displacements have closed-form MSRD and <r>."""
+
+    SIGMA = 0.05
+    N_FRAMES = 4000
+
+    @pytest.fixture()
+    def first_shell(self, generate_trajectory, aiida_profile):
+        from aiida.orm import Dict
+
+        from aiida_feff.calcfunctions.debye_waller import store_msrd
+
+        traj = generate_trajectory(n_frames=self.N_FRAMES, reps=2, sigma=self.SIGMA, seed=0)
+        # 2.7 Å < the 2.77 Å inscribed-sphere radius of the 2x2x2 cell.
+        params = Dict({"absorber_site": "Fe.1", "cutoff": 2.7})
+        shells = store_msrd(trajectory=traj, params=params).get_dict()
+        return min(shells.values(), key=lambda v: v["reff"])
+
+    def test_sigma2_approaches_twice_the_displacement_variance(self, first_shell):
+        # sigma2 of a bond = Var(u_A - u_B) = 2 sigma^2 for independent atoms.
+        assert first_shell["sigma2"] == pytest.approx(2 * self.SIGMA**2, rel=0.05)
+
+    def test_mean_distance_shows_perpendicular_displacement_bias(self, first_shell):
+        # <r> exceeds the equilibrium bond length by <u_perp^2> / 2 r_eq, with
+        # <u_perp^2> = 2 x 2 sigma^2 over the two perpendicular directions.
+        expected = BCC_FE_NN + 2 * self.SIGMA**2 / BCC_FE_NN
+        assert first_shell["reff"] > BCC_FE_NN
+        assert first_shell["reff"] == pytest.approx(expected, abs=1e-3)
+
+    def test_first_shell_has_eight_neighbours(self, first_shell):
+        assert first_shell["count"] == 8  # BCC coordination number
+
+
+class TestComputeMsrd:
+    """Behaviour of the store_msrd calcfunction."""
 
     def test_keys_contain_path_labels(self, generate_trajectory, aiida_profile):
         from aiida.orm import Dict
 
         from aiida_feff.calcfunctions.debye_waller import store_msrd
 
-        traj = generate_trajectory(n_frames=50, n_atoms=2, sigma=0.05, seed=1)
-        params = Dict({"absorber_site": "Fe", "cutoff": 3.5})
-        result = store_msrd(trajectory=traj, params=params)
+        traj = generate_trajectory(n_frames=50, reps=2, sigma=0.05, seed=1)
+        result = store_msrd(trajectory=traj, params=Dict({"absorber_site": "Fe.1", "cutoff": 2.7}))
         d = result.get_dict()
         assert len(d) > 0, "Expected at least one path in output"
         for key in d:
             assert "2body" in key or "3body" in key
 
-    def test_sigma2_positive(self, generate_trajectory, aiida_profile):
+    def test_skip_frames_keeps_the_same_shells(self, generate_trajectory, aiida_profile):
         from aiida.orm import Dict
 
         from aiida_feff.calcfunctions.debye_waller import store_msrd
 
-        traj = generate_trajectory(n_frames=100, n_atoms=2, sigma=0.05, seed=2)
-        params = Dict({"absorber_site": "Fe", "cutoff": 3.5})
-        result = store_msrd(trajectory=traj, params=params)
-        for key, val in result.get_dict().items():
-            assert val["sigma2"] >= 0.0, f"sigma2 must be non-negative for path '{key}'"
-
-    def test_reff_near_bcc_fe_nn(self, generate_trajectory, aiida_profile):
-        """First-shell reff should be close to BCC-Fe nearest-neighbour distance."""
-        from aiida.orm import Dict
-
-        from aiida_feff.calcfunctions.debye_waller import store_msrd
-
-        traj = generate_trajectory(n_frames=200, n_atoms=2, sigma=0.02, seed=3)
-        params = Dict({"absorber_site": "Fe", "cutoff": 3.5})
-        result = store_msrd(trajectory=traj, params=params)
-        d = result.get_dict()
-        # BCC Fe nearest-neighbour: a*sqrt(3)/2 ≈ 2.48 Å
-        # Key format uses 'p' instead of '.' in reff (e.g. "Fe-Fe_2p48_2body")
-        reffs = [v["reff"] for v in d.values() if v["n_body"] == 2]
-        assert len(reffs) > 0, "Expected at least one 2-body path"
-        assert any(abs(r - 2.48) < 0.15 for r in reffs), f"Expected a reff near 2.48 Å; got {reffs}"
-
-    def test_skip_frames_reduces_frames(self, generate_trajectory, aiida_profile):
-        """skip_frames should not crash and should still produce valid paths."""
-        from aiida.orm import Dict
-
-        from aiida_feff.calcfunctions.debye_waller import store_msrd
-
-        traj = generate_trajectory(n_frames=60, n_atoms=2, sigma=0.05, seed=4)
-        params_full = Dict({"absorber_site": "Fe", "cutoff": 3.5})
-        params_skip = Dict({"absorber_site": "Fe", "cutoff": 3.5, "skip_frames": 10})
-        result_full = store_msrd(trajectory=traj, params=params_full)
-        result_skip = store_msrd(trajectory=traj, params=params_skip)
-        # Both should produce at least one path
-        assert len(result_full.get_dict()) > 0
-        assert len(result_skip.get_dict()) > 0
-        # Both should produce the same number of shells (identical topology)
-        assert len(result_full.get_dict()) == len(result_skip.get_dict())
+        traj = generate_trajectory(n_frames=60, reps=2, sigma=0.05, seed=4)
+        base = {"absorber_site": "Fe.1", "cutoff": 2.7}
+        full = store_msrd(trajectory=traj, params=Dict(base)).get_dict()
+        skipped = store_msrd(trajectory=traj, params=Dict({**base, "skip_frames": 10})).get_dict()
+        # Same topology, so the same shells with the same occupancies; only the
+        # statistics over frames differ.
+        assert len(full) == len(skipped)
+        assert sorted(v["count"] for v in full.values()) == sorted(
+            v["count"] for v in skipped.values()
+        )
+        for a, b in zip(
+            sorted(full.values(), key=lambda v: v["reff"]),
+            sorted(skipped.values(), key=lambda v: v["reff"]),
+            strict=True,
+        ):
+            assert a["reff"] == pytest.approx(b["reff"], abs=0.02)
 
     def test_missing_absorber_site_raises(self, generate_trajectory, aiida_profile):
         from aiida.orm import Dict
 
         from aiida_feff.calcfunctions.debye_waller import store_msrd
 
-        traj = generate_trajectory(n_frames=10, n_atoms=2, sigma=0.05, seed=5)
-        params = Dict({"cutoff": 3.5})
+        traj = generate_trajectory(n_frames=10, reps=2, sigma=0.05, seed=5)
         with pytest.raises(ValueError, match="absorber_site"):
-            store_msrd(trajectory=traj, params=params)
+            store_msrd(trajectory=traj, params=Dict({"cutoff": 2.7}))
 
-    def test_n_body_field_is_2(self, generate_trajectory, aiida_profile):
+    def test_unknown_parameter_raises(self, generate_trajectory, aiida_profile):
+        """A silently-ignored key is a wrong answer the user cannot see."""
         from aiida.orm import Dict
 
         from aiida_feff.calcfunctions.debye_waller import store_msrd
 
-        traj = generate_trajectory(n_frames=50, n_atoms=2, sigma=0.05, seed=6)
-        params = Dict({"absorber_site": "Fe", "cutoff": 3.5})
-        result = store_msrd(trajectory=traj, params=params)
-        for val in result.get_dict().values():
-            assert val["n_body"] == 2  # no 3-body paths requested
+        traj = generate_trajectory(n_frames=10, reps=2, sigma=0.05, seed=5)
+        params = Dict({"absorber_site": "Fe.1", "cutoff": 2.7, "align": True})
+        with pytest.raises(ValueError, match="does not use parameter"):
+            store_msrd(trajectory=traj, params=params)
+
+    def test_two_body_only_without_cutoff_3body(self, generate_trajectory, aiida_profile):
+        from aiida.orm import Dict
+
+        from aiida_feff.calcfunctions.debye_waller import store_msrd
+
+        traj = generate_trajectory(n_frames=50, reps=2, sigma=0.05, seed=6)
+        result = store_msrd(trajectory=traj, params=Dict({"absorber_site": "Fe.1", "cutoff": 2.7}))
+        assert all(v["n_body"] == 2 for v in result.get_dict().values())
+
+    def test_three_body_paths_are_produced_and_labelled(self, generate_trajectory, aiida_profile):
+        from aiida.orm import Dict
+
+        from aiida_feff.calcfunctions.debye_waller import store_msrd
+
+        traj = generate_trajectory(n_frames=40, reps=2, sigma=0.03, seed=7)
+        params = Dict({"absorber_site": "Fe.1", "cutoff": 2.7, "cutoff_3body": 2.7})
+        d = store_msrd(trajectory=traj, params=params).get_dict()
+        three_body = [v for v in d.values() if v["n_body"] == 3]
+        assert three_body, "expected 3-body paths when cutoff_3body is set"
+        for path in three_body:
+            # Included angle at the first scatterer, so within (0, 180].
+            assert 0.0 < path["angle"] <= 180.0
+            # reff is half the total path length, per FEFF's convention, so it
+            # is longer than the 2-body bond but shorter than the perimeter.
+            assert path["reff"] > BCC_FE_NN
 
 
 class TestComputeAdp:
     """Tests for the store_adp calcfunction."""
 
-    def test_returns_array_data(self, generate_trajectory, aiida_profile):
-        from aiida.orm import ArrayData, Dict
-
-        from aiida_feff.calcfunctions.debye_waller import store_adp
-
-        traj = generate_trajectory(n_frames=30, n_atoms=2, sigma=0.05, seed=10)
-        params = Dict({})
-        result = store_adp(trajectory=traj, params=params)
-        assert isinstance(result, ArrayData)
-
-    def test_b_factors_shape(self, generate_trajectory, aiida_profile):
+    def test_b_factor_approaches_8pi2_sigma_squared(self, generate_trajectory, aiida_profile):
         from aiida.orm import Dict
 
         from aiida_feff.calcfunctions.debye_waller import store_adp
 
-        n_atoms = 4
-        traj = generate_trajectory(n_frames=30, n_atoms=n_atoms, sigma=0.05, seed=11)
-        params = Dict({})
-        result = store_adp(trajectory=traj, params=params)
-        assert result.get_array("b_factors").shape == (n_atoms,)
-
-    def test_u_tensor_shape(self, generate_trajectory, aiida_profile):
-        from aiida.orm import Dict
-
-        from aiida_feff.calcfunctions.debye_waller import store_adp
-
-        n_atoms = 4
-        traj = generate_trajectory(n_frames=30, n_atoms=n_atoms, sigma=0.05, seed=12)
-        params = Dict({})
-        result = store_adp(trajectory=traj, params=params)
-        assert result.get_array("u_tensor").shape == (n_atoms, 3, 3)
-
-    def test_b_factors_positive(self, generate_trajectory, aiida_profile):
-        from aiida.orm import Dict
-
-        from aiida_feff.calcfunctions.debye_waller import store_adp
-
-        traj = generate_trajectory(n_frames=50, n_atoms=2, sigma=0.05, seed=13)
-        params = Dict({})
-        result = store_adp(trajectory=traj, params=params)
+        sigma = 0.05
+        traj = generate_trajectory(n_frames=4000, reps=2, sigma=sigma, seed=13)
+        result = store_adp(trajectory=traj, params=Dict({"align": False}))
         b = result.get_array("b_factors")
-        assert np.all(b > 0), f"All B-factors should be positive; got {b}"
+        assert b.mean() == pytest.approx(8 * np.pi**2 * sigma**2, rel=0.02)
 
-    def test_symbols_attribute_preserved(self, generate_trajectory, aiida_profile):
+    def test_u_tensor_is_isotropic_for_isotropic_noise(self, generate_trajectory, aiida_profile):
         from aiida.orm import Dict
 
         from aiida_feff.calcfunctions.debye_waller import store_adp
 
-        traj = generate_trajectory(n_frames=20, n_atoms=2, sigma=0.05, seed=14)
-        params = Dict({})
-        result = store_adp(trajectory=traj, params=params)
-        symbols = result.base.attributes.get("symbols")
-        assert symbols == ["Fe", "Fe"]
+        sigma = 0.05
+        traj = generate_trajectory(n_frames=4000, reps=2, sigma=sigma, seed=14)
+        u = store_adp(trajectory=traj, params=Dict({"align": False})).get_array("u_tensor")
+        diagonal = np.einsum("nii->ni", u)
+        off_diagonal = u[:, 0, 1]
+        assert diagonal.mean() == pytest.approx(sigma**2, rel=0.05)
+        assert abs(off_diagonal.mean()) < 0.05 * sigma**2
 
-    def test_avg_positions_shape(self, generate_trajectory, aiida_profile):
+    def test_shapes_and_symbols(self, generate_trajectory, aiida_profile):
         from aiida.orm import Dict
 
         from aiida_feff.calcfunctions.debye_waller import store_adp
 
-        n_atoms = 2
-        traj = generate_trajectory(n_frames=30, n_atoms=n_atoms, sigma=0.05, seed=15)
-        params = Dict({})
-        result = store_adp(trajectory=traj, params=params)
+        traj = generate_trajectory(n_frames=30, reps=2, sigma=0.05, seed=11)
+        n_atoms = len(traj.get_array("positions")[0])
+        result = store_adp(trajectory=traj, params=Dict({}))
+        assert result.get_array("b_factors").shape == (n_atoms,)
+        assert result.get_array("u_tensor").shape == (n_atoms, 3, 3)
         assert result.get_array("avg_positions").shape == (n_atoms, 3)
+        assert result.base.attributes.get("symbols") == ["Fe"] * n_atoms
+
+    def test_unknown_parameter_raises(self, generate_trajectory, aiida_profile):
+        from aiida.orm import Dict
+
+        from aiida_feff.calcfunctions.debye_waller import store_adp
+
+        traj = generate_trajectory(n_frames=10, reps=2, sigma=0.05, seed=15)
+        with pytest.raises(ValueError, match="does not use parameter"):
+            store_adp(trajectory=traj, params=Dict({"cutoff": 3.5}))

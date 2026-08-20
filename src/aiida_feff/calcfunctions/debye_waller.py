@@ -40,6 +40,39 @@ from ase.geometry import find_mic
 
 logger = logging.getLogger(__name__)
 
+#: Keys :func:`compute_msrd` reads.  ``align`` is deliberately absent: MSRD is
+#: computed from raw coordinates because Kabsch alignment rotates the frame
+#: away from the cell used for the minimum-image convention.
+MSRD_PARAM_KEYS = frozenset(
+    {
+        "absorber_site",
+        "cutoff",
+        "tol_dist",
+        "tol_angle",
+        "cutoff_3body",
+        "skip_frames",
+        "exclude_hydrogen",
+        "allow_unsafe_cutoff",
+    }
+)
+
+#: Keys :func:`compute_adp` reads.
+ADP_PARAM_KEYS = frozenset({"skip_frames", "align"})
+
+
+def _reject_unknown_params(params: dict, allowed: frozenset[str], func_name: str) -> None:
+    """Raise on parameters the function does not read.
+
+    A key that is accepted and ignored still changes the hash of the ``Dict``
+    input node, so AiiDA records two provenance-distinct calls that produced
+    identical output — while the user believes their setting took effect.
+    """
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        raise ValueError(
+            f"{func_name} does not use parameter(s) {unknown}. Recognised keys: {sorted(allowed)}"
+        )
+
 
 # ===========================================================================
 # Pure computation helpers (no AiiDA, no file I/O)
@@ -138,10 +171,20 @@ def _compute_adp_impl(
     positions_proc: np.ndarray,
     symbols: list[str],
 ) -> dict[str, Any]:
-    """Compute ADP tensors and B-factors from processed positions."""
+    """Compute ADP tensors and B-factors from processed positions.
+
+    ``U_ij`` is the **sample** covariance of the displacements (``ddof=1``),
+    matching the σ² convention used for MSRD in this module so the two second
+    moments are the same estimator.  For uncorrelated Gaussian displacements
+    of width σ this gives ``B → 8π²σ²``.
+    """
+    n_frames = len(positions_proc)
+    min_frames_for_variance = 2
+    if n_frames < min_frames_for_variance:
+        raise ValueError(f"ADPs need at least 2 frames, got {n_frames}.")
     avg_pos = positions_proc.mean(axis=0)
     disp = positions_proc - avg_pos[np.newaxis]
-    u_tensor = np.einsum("fni,fnj->nij", disp, disp) / len(positions_proc)
+    u_tensor = np.einsum("fni,fnj->nij", disp, disp) / (n_frames - 1)
     b_factors = 8 * np.pi**2 * np.trace(u_tensor, axis1=1, axis2=2) / 3
     return {
         "avg_positions": avg_pos,
@@ -173,12 +216,55 @@ def _max_safe_mic_cutoff(cell: np.ndarray) -> float | None:
     return min(volume / area_ab, volume / area_bc, volume / area_ca) / 2.0
 
 
+def _check_mic_cutoffs(
+    cell: np.ndarray,
+    cutoff: float,
+    cutoff_3body: float | None,
+    allow_unsafe: bool,
+) -> None:
+    """Raise (or warn) when a neighbour cutoff outruns the minimum-image convention.
+
+    ``find_mic`` returns the shortest image displacement.  Once the cutoff
+    exceeds the largest sphere that fits inside the cell, that shortest image
+    can be a different atom than the one intended, so distances are biased
+    downward and σ² collapses.  Nothing downstream can detect this, which is
+    why it is an error rather than a warning.
+    """
+    max_safe = _max_safe_mic_cutoff(cell)
+    if max_safe is None:
+        return
+    for name, value in (("cutoff", cutoff), ("cutoff_3body", cutoff_3body)):
+        if value is None or value <= 0 or value <= max_safe:
+            continue
+        message = (
+            f"{name}={value:.3f} Å exceeds this cell's maximum safe "
+            f"minimum-image cutoff ({max_safe:.3f} Å): distances would be biased "
+            f"towards periodic images. Build a supercell, or reduce {name} to "
+            f"<= {max_safe:.3f} Å."
+        )
+        if allow_unsafe:
+            logger.warning("%s (allow_unsafe_cutoff=True, continuing)", message)
+        else:
+            raise ValueError(message + " Pass allow_unsafe_cutoff=True to override.")
+
+
 def _cluster_by_tolerance(items: list[dict], key: str, tol: float) -> list[list[dict]]:
-    """Sort *items* by *key* and greedily cluster where consecutive means are within *tol*."""
+    """Sort *items* by *key* and greedily cluster them, bounding cluster width by *tol*.
+
+    Complete linkage: an item joins the current cluster only if the resulting
+    cluster still spans no more than *tol*.  Comparing against the cluster's
+    running *mean* instead lets a dense ladder of paths chain into one cluster
+    far wider than the tolerance the caller asked for, which then pools
+    genuinely different shells into a single σ².
+
+    An empty *items* yields no clusters rather than raising.
+    """
+    if not items:
+        return []
     items = sorted(items, key=lambda x: x[key])
     clusters: list[list[dict]] = [[items[0]]]
     for item in items[1:]:
-        if abs(item[key] - np.mean([x[key] for x in clusters[-1]])) <= tol:
+        if item[key] - clusters[-1][0][key] <= tol:
             clusters[-1].append(item)
         else:
             clusters.append([item])
@@ -197,6 +283,7 @@ def _calculate_grouped_msrd_impl(
     tol_angle: float = 5.0,
     cutoff_3body: float | None = None,
     exclude_hydrogen: bool = False,
+    allow_unsafe_cutoff: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Compute grouped MSRD σ² for 2-body and 3-body scattering paths.
 
@@ -217,30 +304,21 @@ def _calculate_grouped_msrd_impl(
     tol_dist:
         Distance tolerance for grouping paths into shells (Å).
     tol_angle:
-        Angle tolerance for 3-body path grouping (degrees).
+        Angle tolerance for 3-body path grouping (degrees).  The angle is the
+        **included angle at the first scatterer**, i.e. 180° − FEFF's
+        scattering angle.
     cutoff_3body:
         Leg cutoff for 3-body paths.  ``None`` / ``0`` disables 3-body.
     exclude_hydrogen:
         When True, H atoms are excluded from the neighbour search.
+    allow_unsafe_cutoff:
+        Proceed even when a cutoff exceeds the cell's inscribed-sphere radius.
+        Off by default: past that radius the minimum-image convention picks
+        the nearest periodic image, which biases distances downward and σ²
+        by tens of percent — silently, and in the direction that looks like
+        better-ordered material.
     """
-    # Warn if any cutoff exceeds the largest sphere that fits in the cell.
-    # Beyond this radius the MIC becomes ambiguous for non-orthogonal cells.
-    max_safe = _max_safe_mic_cutoff(cell)
-    if max_safe is not None:
-        for name, value in [("cutoff", cutoff), ("cutoff_3body", cutoff_3body)]:
-            if value is not None and value > 0 and value > max_safe:
-                logger.warning(
-                    "%s=%.3f Å exceeds the maximum safe MIC cutoff "
-                    "for this unit cell (%.3f Å). Distances may be "
-                    "ambiguous because the sphere overlaps with its "
-                    "own periodic images. Consider using a supercell or "
-                    "reducing %s to <= %.3f Å.",
-                    name,
-                    value,
-                    max_safe,
-                    name,
-                    max_safe,
-                )
+    _check_mic_cutoffs(cell, cutoff, cutoff_3body, allow_unsafe_cutoff)
 
     central_element = symbols[central_indices[0]]
 
@@ -294,12 +372,20 @@ def _calculate_grouped_msrd_impl(
                 n1, n2 = nb3[i], nb3[j]
                 v01, d01 = mic_cache[n1]
                 v02, d02 = mic_cache[n2]
-                raw12 = positions[:, n2, :] - positions[:, n1, :]
-                _v12, d12 = find_mic(raw12, cell, pbc)  # type: ignore[arg-type]
+                # The scattering path is absorber -> n1 -> n2 -> absorber for
+                # the two neighbour *images* already chosen relative to the
+                # absorber, so the n1->n2 leg is fixed by those choices.
+                # Minimum-imaging it independently can pick a third image that
+                # belongs to no triangle, leaving L longer or shorter than any
+                # real path and the vertex angle inconsistent with it.
+                v12 = v02 - v01
+                d12 = np.linalg.norm(v12, axis=1)
                 L = d01 + d12 + d02
 
+                # Included angle at the first scatterer: 180° - FEFF's
+                # scattering angle.
                 v1 = -v01
-                v2 = _v12
+                v2 = v12
                 v1u = v1 / np.maximum(np.linalg.norm(v1, axis=1, keepdims=True), 1e-10)
                 v2u = v2 / np.maximum(np.linalg.norm(v2, axis=1, keepdims=True), 1e-10)
                 cos_t = np.clip((v1u * v2u).sum(axis=1), -1, 1)
@@ -437,6 +523,24 @@ def compute_msrd(
             Discard the first N frames (equilibration).
         ``exclude_hydrogen`` : bool, default False
             Exclude H atoms from the neighbour search.
+        ``allow_unsafe_cutoff`` : bool, default False
+            Permit a cutoff larger than the cell's inscribed-sphere radius.
+            Leave this off unless you know the bias is acceptable.
+
+    Conventions
+    -----------
+    * σ² is a **variance** in Å², pooled over frames *and* over the paths
+      grouped into a shell.  It therefore contains both the thermal and the
+      static (configurational) spread; with a loose ``tol_dist`` the static
+      term can dominate.
+    * σ² uses the sample estimator (``ddof=1``), matching ``compute_adp``.
+    * For 3-body paths ``reff`` is half the total path length, per FEFF, and
+      ``angle`` is the included angle at the first scatterer — 180° minus
+      FEFF's scattering angle.  The scatterer–scatterer leg is taken as the
+      difference of the two absorber-relative minimum-image vectors, so the
+      triangle always closes.
+    * The minimum-image convention uses the **frame-0 cell**.  For an NPT
+      trajectory with a drifting cell this is an approximation.
 
     Returns:
     -------
@@ -446,12 +550,14 @@ def compute_msrd(
 
             {
                 "reff":    float,   # mean effective path length (Å)
-                "sigma2":  float,   # MSRD σ² (Å²)
+                "sigma2":  float,   # MSRD σ² (Å², variance, ddof=1)
                 "count":   int,     # number of paths averaged into this shell
                 "n_body":  int,     # 2 or 3
-                "angle":   float | None,  # mean angle for 3-body paths (°)
+                "angle":   float | None,  # mean included angle, 3-body (°)
             }
     """
+    _reject_unknown_params(params, MSRD_PARAM_KEYS, "compute_msrd")
+
     absorber_site = params.get("absorber_site")
     if not absorber_site:
         raise ValueError("params must include 'absorber_site'")
@@ -462,16 +568,32 @@ def compute_msrd(
     cutoff_3body = params.get("cutoff_3body")
     skip = int(params.get("skip_frames", 0))
     excl_h = bool(params.get("exclude_hydrogen", False))
+    allow_unsafe = bool(params.get("allow_unsafe_cutoff", False))
 
     positions = trajectory.get_array("positions")[skip:]
     symbols: list[str] = trajectory.base.attributes.get("symbols")
     try:
         cells = trajectory.get_array("cells")[skip:]
     except KeyError:
+        # A zero cell makes ASE's find_mic treat the system as non-periodic,
+        # which is the right answer for a cluster — but say so, because the
+        # safe-cutoff check cannot run without a cell.
+        logger.warning(
+            "TrajectoryData has no 'cells' array; treating the system as "
+            "non-periodic and skipping the minimum-image cutoff check."
+        )
         cells = np.zeros((len(positions), 3, 3))
 
+    # TrajectoryData carries no pbc flags, so full periodicity is assumed.
+    # For a slab or a molecule in a box this creates spurious images along the
+    # vacuum direction; pad such systems or pass a non-periodic (zero) cell.
     pbc = [True, True, True]
     ref_cell = cells[0]
+    if len(cells) > 1 and not np.allclose(cells, ref_cell):
+        logger.warning(
+            "Cell varies across frames (NPT?); the minimum-image convention "
+            "uses frame 0 for every frame."
+        )
 
     central_indices = _parse_site_spec(absorber_site, symbols)
     logger.info(
@@ -495,6 +617,7 @@ def compute_msrd(
         tol_angle=tol_angle,
         cutoff_3body=cutoff_3body,
         exclude_hydrogen=excl_h,
+        allow_unsafe_cutoff=allow_unsafe,
     )
 
     output: dict[str, Any] = {}
@@ -560,6 +683,8 @@ def compute_adp(
         ``avg_positions`` (ndarray, shape ``(n_atoms, 3)``),
         ``symbols`` (list[str]).
     """
+    _reject_unknown_params(params, ADP_PARAM_KEYS, "compute_adp")
+
     skip = int(params.get("skip_frames", 0))
     align = bool(params.get("align", True))
 

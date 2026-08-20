@@ -1,5 +1,10 @@
 """Shared pytest fixtures for aiida-feff tests."""
 
+import json
+import shutil
+from pathlib import Path
+
+import numpy as np
 import pytest
 from aiida import orm
 
@@ -63,38 +68,113 @@ def generate_feff_parameters():
     return _generate
 
 
+#: Lattice parameter of the BCC-Fe test system (Å).
+BCC_FE_A = 2.87
+#: Nearest-neighbour distance in that lattice: the body diagonal half-length.
+BCC_FE_NN = BCC_FE_A * np.sqrt(3) / 2
+
+
+def bcc_supercell_positions(reps: int, a: float = BCC_FE_A) -> tuple[np.ndarray, np.ndarray]:
+    """Return (equilibrium positions, cell) for a ``reps``³ BCC supercell.
+
+    A genuine supercell, not a tiled 2-atom basis: tiling the basis puts
+    several atoms at the *same* coordinates, which makes any distance-based
+    test meaningless.
+    """
+    basis = np.array([[0.0, 0.0, 0.0], [0.5, 0.5, 0.5]])
+    offsets = np.array([[i, j, k] for i in range(reps) for j in range(reps) for k in range(reps)])
+    frac = (offsets[:, None, :] + basis[None, :, :]).reshape(-1, 3)
+    cell = np.eye(3) * (a * reps)
+    return frac * a, cell
+
+
 @pytest.fixture()
 def generate_trajectory():
-    """Return a factory that creates a small BCC-Fe TrajectoryData node."""
-    import numpy as np
+    """Return a factory that creates a BCC-Fe TrajectoryData node.
+
+    ``reps=2`` by default, giving a 5.74 Å cell whose minimum-image-safe
+    cutoff is 2.87 Å — enough for the first two shells.  Distance-based tests
+    must keep their cutoff below :func:`_max_safe_mic_cutoff` of the cell they
+    use, so raise ``reps`` rather than the cutoff.
+    """
     from aiida.orm import TrajectoryData
 
-    def _generate(n_frames: int = 10, n_atoms: int = 2, sigma: float = 0.05, seed: int = 0):
+    def _generate(
+        n_frames: int = 10,
+        reps: int = 2,
+        sigma: float = 0.05,
+        seed: int = 0,
+        n_atoms: int | None = None,
+    ):
         rng = np.random.default_rng(seed)
-        a = 2.87
-        # BCC basis: corner + body-centre; tile to reach n_atoms
-        bcc_basis = np.array([[0.0, 0.0, 0.0], [a / 2, a / 2, a / 2]])
-        reps = int(np.ceil(n_atoms / 2))
-        eq = np.tile(bcc_basis, (reps, 1))[:n_atoms]
-        positions = eq[np.newaxis] + rng.normal(scale=sigma, size=(n_frames, n_atoms, 3))
-        cells = np.tile([[a, 0, 0], [0, a, 0], [0, 0, a]], (n_frames, 1, 1))
-        steps = np.arange(n_frames)
+        eq, cell = bcc_supercell_positions(reps)
+        if n_atoms is not None:
+            eq = eq[:n_atoms]
+        positions = eq[np.newaxis] + rng.normal(scale=sigma, size=(n_frames, len(eq), 3))
+        cells = np.tile(cell, (n_frames, 1, 1))
 
         traj = TrajectoryData()
         traj.set_array("positions", positions)
         traj.set_array("cells", cells)
-        traj.set_array("steps", steps)
-        traj.base.attributes.set("symbols", ["Fe"] * n_atoms)
+        traj.set_array("steps", np.arange(n_frames))
+        traj.base.attributes.set("symbols", ["Fe"] * len(eq))
         return traj
 
     return _generate
 
 
+#: Real Feff8L output checked into the repo; see the README beside it.
+FIXTURE_DIR = Path(__file__).parent / "fixtures" / "aggregate_paths"
+
+
+def import_remote_script(name: str):
+    """Import one of the compute-node scripts by path.
+
+    ``_aggregate_paths.py`` and ``_run_batch.py`` are shipped to the cluster
+    and run under an interpreter with no aiida-core, so they are imported here
+    the same way — by file, not as a package member.
+    """
+    import importlib.util
+
+    path = Path(__file__).parent.parent / "src" / "aiida_feff" / "calculations" / name
+    spec = importlib.util.spec_from_file_location(name.removesuffix(".py"), path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture()
+def feff_workdir(tmp_path):
+    """A temporary directory pre-populated with the real FEFF fixtures."""
+    for src in [*FIXTURE_DIR.glob("feff????.dat"), FIXTURE_DIR / "files.dat"]:
+        shutil.copy(src, tmp_path / src.name)
+    return tmp_path
+
+
+@pytest.fixture()
+def aggregated_hdf5(feff_workdir, monkeypatch):
+    """Run the real aggregation script over the fixtures; return the HDF5 bytes."""
+    pytest.importorskip("larch.xafs.feffdat")
+    (feff_workdir / "_feff_aggregate_config.json").write_text(
+        json.dumps({"threshold": 0.0, "frame_idx": 3, "site_idx": 1, "absorber_element": "Ti"})
+    )
+    monkeypatch.chdir(feff_workdir)
+    module = import_remote_script("_aggregate_paths.py")
+    module.main()
+    return (feff_workdir / "contributions_raw.h5").read_bytes()
+
+
+@pytest.fixture()
+def aggregated_node(aggregated_hdf5, aiida_profile):
+    """A PathContributionsData built from real FEFF output."""
+    from aiida_feff.data.pathcontributions import PathContributionsData
+
+    return PathContributionsData.from_hdf5_bytes(aggregated_hdf5)
+
+
 @pytest.fixture()
 def generate_xas_data():
     """Return a factory that creates a populated XasData node."""
-    import numpy as np
-
     from aiida_feff.data.xasdata import XasData
 
     def _generate():
@@ -184,7 +264,7 @@ def parse_retrieved(aiida_profile_clean):
     from aiida.orm import CalcJobNode, FolderData
     from aiida.plugins import ParserFactory
 
-    def _parse(entry_point_name, retrieved):
+    def _parse(entry_point_name, retrieved, inputs=None):
         folder = FolderData()
         for filename, content in retrieved.items():
             data = content.encode() if isinstance(content, str) else content
@@ -192,7 +272,13 @@ def parse_retrieved(aiida_profile_clean):
         folder.store()
 
         node = CalcJobNode()
-        node.set_process_type("aiida.calculations:feff.feff")
+        # Follow the entry point given, so this fixture can drive either parser.
+        node.set_process_type(f"aiida.calculations:{entry_point_name}")
+        # Input links must be attached before the node is stored; the parser
+        # reads them to decide, for example, whether a run was potentials-only.
+        for label, input_node in (inputs or {}).items():
+            stored = input_node if input_node.is_stored else input_node.store()
+            node.base.links.add_incoming(stored, link_type=LinkType.INPUT_CALC, link_label=label)
         node.store()
 
         folder.base.links.add_incoming(node, link_type=LinkType.CREATE, link_label="retrieved")

@@ -6,13 +6,18 @@ repos:
         args: [--fix]
       - id: ruff-format
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.14.1
+  - repo: local
     hooks:
+      # mypy runs through uv, in the project environment. The mirrors-mypy hook
+      # installs mypy into an isolated venv without aiida, numpy or pymatgen,
+      # so every annotation from those packages degrades to Any and the check
+      # passes vacuously.
       - id: mypy
-        additional_dependencies: [types-tabulate]
+        name: mypy
+        entry: uv run mypy src
+        language: system
+        types: [python]
         pass_filenames: false
-        args: [src]
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0

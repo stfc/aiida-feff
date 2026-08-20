@@ -24,9 +24,6 @@ import numpy as np
 from aiida import load_profile, orm
 from aiida.engine import run_get_node
 
-load_profile()
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -137,6 +134,13 @@ def make_trajectory(
     ),
 )
 @click.option(
+    "--path-r-bin",
+    default=0.15,
+    show_default=True,
+    type=float,
+    help="Bin width (Å) for grouping equivalent scattering paths across frames.",
+)
+@click.option(
     "--plot-file", default=None, help="Save the plot to this path instead of showing interactively."
 )
 @click.option(
@@ -156,9 +160,14 @@ def main(
     store_paths,
     python_code,
     path_cw_threshold,
+    path_r_bin,
     plot_file,
     group_label,
 ):
+    # Loading the profile here rather than at import keeps --help usable
+    # on a machine with no AiiDA profile configured.
+    load_profile()
+
     from aiida_feff.calcfunctions.larch import chi_k_to_r
     from aiida_feff.data.parameters import FeffParameters
     from aiida_feff.workflows.ensemble import EnsembleExafsWorkChain
@@ -176,14 +185,10 @@ def main(
         dict={
             "title": "Synthetic BCC Fe ensemble",
             "edge": "K",
-            "calc_mode": "EXAFS",
+            "spectrum_type": "EXAFS",
             "s02": 1.0,
-            "rpath": 5.5,
+            "radius": 5.5,
             "nleg": 4,
-            "scf_radius": 4.0,
-            "fms_radius": 6.0,
-            "kmin": 0.0,
-            "kmax": 20.0,
         }
     )
     params.store()
@@ -209,6 +214,9 @@ def main(
             raise click.UsageError("--store-paths requires --python-code (e.g. python3@localhost).")
         wc_inputs["python_code"] = orm.load_code(python_code)
         wc_inputs["path_cw_threshold"] = orm.Float(path_cw_threshold)
+        # Same binning here and in the merged node, so the groups this script
+        # plots are the groups the provenance graph recorded.
+        wc_inputs["path_r_bin"] = orm.Float(path_r_bin)
 
     if group_label:
         wc_inputs["group_label"] = orm.Str(group_label)
@@ -259,7 +267,10 @@ def main(
     click.echo("Computing Debye-Waller σ² from trajectory …")
     from aiida_feff.calcfunctions.debye_waller import store_msrd
 
-    dw_params = orm.Dict({"absorber_site": "Fe", "cutoff": 3.5, "align": True})
+    # cutoff must stay inside the cell's inscribed sphere or the minimum-image
+    # convention aliases neighbours and biases sigma^2 low; compute_msrd raises
+    # rather than returning a quietly wrong number.
+    dw_params = orm.Dict({"absorber_site": "Fe.1", "cutoff": 2.7})
     msrd_node = store_msrd(trajectory=traj, params=dw_params)
     click.echo(f"  store_msrd pk={msrd_node.pk}")
     click.echo("  Path σ² (Å²):")
@@ -276,152 +287,61 @@ def main(
             snapshot_xas.append(child.outputs.xas_data)
 
     # ── 7. Per-path χ(k) contributions ──────────────────────────────────────
-    # Each feff????.dat file contains the scattering data needed to reconstruct
-    # the path's contribution to χ(k):
-    #
-    #   k²χ_j(k) = N · red · k · |F(k)| / r²
-    #              · exp(−2r/λ(k))          ← mean-free-path damping
-    #              · exp(−2σ²k²)             ← Debye-Waller (supplied via --sigma2-dw)
-    #              · sin(2k·r_eff + δ_back(k) + 2φ_c(k))   ← oscillation
-    #
-    # feff_data columns (FEFF_DATA_COLS order):
-    #   [0] real_2phc  = 2φ_c(k)   central-atom phase shift
-    #   [1] mag        = |F_eff(k)| backscattering amplitude
-    #   [2] phase      = δ_back(k)  backscattering phase
-    #   [3] red_factor = S₀² and other reduction factors (NOT Debye-Waller)
-    #   [4] lambda_mfp = λ(k)       mean free path (Å)
-    #
-    # Without exp(−2σ²k²), the envelope rises monotonically with k (k·|F|
-    # grows faster than exp(−2r/λ) decays at moderate k); with a realistic
-    # σ² the curves peak and damp just like the measured χ(k).
-    #
-    # Frequency: a path that appears in only 3 of 6 snapshots gets weight 0.5.
-    # We track frame presence as a SET to avoid counting a path twice if FEFF
-    # finds two symmetry-equivalent paths at the same rounded r_eff within
-    # one snapshot (this was causing "700%" in the previous version).
-
-    from collections import defaultdict
-
-    n_total_frames = path_contrib.info()["n_frames"] if path_contrib is not None else 0
-
-    path_groups: dict[tuple, dict] = defaultdict(
-        lambda: {
-            "frame_data": {},  # frame_idx → {"mag","lambda","phase","phc2","red"}
-            "k": None,
-            "r_eff": 0.0,
-            "nlegs": 0,
-            "degeneracy": 0.0,
-            "scatterer": "",
-        }
-    )
-    if path_contrib is not None:
-        for pr in path_contrib.iter_paths():
-            key = (round(pr.r_eff, 2), pr.nlegs, pr.scatterer)
-            g = path_groups[key]
-            fi = pr.frame_idx
-            fd = pr.feff_data
-            if fi not in g["frame_data"]:
-                g["frame_data"][fi] = {
-                    "mag": fd[:, 1].copy(),
-                    "lambda": fd[:, 4].copy(),
-                    "phase": fd[:, 2].copy(),
-                    "phc2": fd[:, 0].copy(),
-                    "red": fd[:, 3].copy(),
-                }
-            else:
-                # Average when multiple FEFF paths share the same key in one frame.
-                prev = g["frame_data"][fi]
-                for col_k, col_i in [
-                    ("mag", 1),
-                    ("lambda", 4),
-                    ("phase", 2),
-                    ("phc2", 0),
-                    ("red", 3),
-                ]:
-                    prev[col_k] = 0.5 * (prev[col_k] + fd[:, col_i])
-            g["k"] = pr.k
-            g["r_eff"] = pr.r_eff
-            g["nlegs"] = pr.nlegs
-            g["degeneracy"] = pr.degeneracy
-            g["scatterer"] = pr.scatterer
+    # The EXAFS equation itself lives in aiida_feff.calcfunctions.exafs, where
+    # it is unit-tested against larch's own FeffPathGroup.  Reimplementing it
+    # here would be untested physics in a demo script.
+    from aiida_feff.calcfunctions.exafs import group_paths_by_key, path_result_chi
+    from aiida_feff.calcfunctions.larch import xftf_arrays
 
     k_avg = averaged_xas.get_array("k")
     ft_dict = ft_params.get_dict()
     ft_kmin = ft_dict.get("kmin", 3.0)
     ft_kmax = ft_dict.get("kmax", 14.0)
 
-    def _path_k2chi(g, sigma2, k_out):
-        """Mean oscillatory k²χ_path(k) across frames, interpolated onto k_out."""
-        k_p = g["k"]
-        vals = []
-        for fdata in g["frame_data"].values():
-            phase_tot = fdata["phase"] + fdata["phc2"]  # δ_back + 2φ_c
-            v = (
-                g["degeneracy"]
-                * fdata["red"]
-                * k_p
-                * fdata["mag"]
-                / g["r_eff"] ** 2
-                * np.exp(-2 * g["r_eff"] / fdata["lambda"])
-                * np.exp(-2 * sigma2 * k_p**2)
-                * np.sin(2 * k_p * g["r_eff"] + phase_tot)
-            )
-            vals.append(v)
-        mean_k2chi = np.mean(vals, axis=0)
-        return np.interp(k_out, k_p, mean_k2chi, left=0.0, right=0.0)
+    n_total_frames = path_contrib.info()["n_frames"] if path_contrib is not None else 0
+    groups = group_paths_by_key(path_contrib, r_bin=path_r_bin) if path_contrib is not None else {}
 
-    # Use larch xftf for the path Fourier transforms — same windowing and
-    # normalisation as the chi_k_to_r calcfunction, so path |χ(R)| lines are
-    # on exactly the same scale as the ensemble-average curve with no ad-hoc
-    # calibration factor needed.
-    import larch as _larch_mod
-    from larch.xafs import xftf as _xftf
-
-    _larch_session = _larch_mod.Interpreter()
-
-    def _chi_to_r(k, k2chi, kmin, kmax):
-        """Compute |χ(R)| using larch xftf.
-
-        k2chi is k²-weighted (kweight=2 already applied), so we pass
-        kweight=0 to avoid double-weighting inside larch.
-        """
-        grp = _larch_mod.Group(k=k, chi=k2chi)
-        _xftf(
-            grp,
-            kmin=kmin,
-            kmax=kmax,
-            kweight=0,
-            dk=ft_dict.get("dk", 1.0),
-            rmax_out=ft_dict.get("rmax", 8.0),
-            _larch=_larch_session,
-        )
-        return grp.r, np.abs(grp.chir)
+    def _mean_chi(paths):
+        """Ensemble-mean chi(k) for one path key, on the averaged k grid."""
+        per_frame: dict[int, list] = {}
+        for path in paths:
+            chi = path_result_chi(path, k_avg, sigma2=sigma2_dw)
+            per_frame.setdefault(path.frame_idx, []).append(chi)
+        # Mean within a frame first, then across frames: a frame in which FEFF
+        # found two equivalent paths must not outweigh one where it found one.
+        frame_means = [np.mean(v, axis=0) for v in per_frame.values()]
+        return np.mean(frame_means, axis=0), len(per_frame)
 
     chi_avg = averaged_xas.get_array("chi_k")
     chir_larch = chir_node.get_array("chir_mag")
     r_larch = chir_node.get_array("r")
 
+    mask = (k_avg >= ft_kmin) & (k_avg <= ft_kmax)
     scored = []
-    for _key, g in path_groups.items():
-        if not g["frame_data"]:
-            continue
-        freq = len(g["frame_data"]) / n_total_frames if n_total_frames > 0 else 1.0
-        k2chi = _path_k2chi(g, sigma2_dw, k_avg)
-        mask = (k_avg >= ft_kmin) & (k_avg <= ft_kmax)
+    for key, paths in groups.items():
+        chi_path, n_frames_seen = _mean_chi(paths)
+        freq = n_frames_seen / n_total_frames if n_total_frames else 1.0
+        k2chi = k_avg**2 * chi_path
         score = freq * np.trapezoid(np.abs(k2chi[mask]), k_avg[mask])
-        scored.append((score, key, g, k2chi, freq))
+        representative = paths[0]
+        scored.append((score, key, representative, k2chi, freq))
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[:top_paths]
+
+    def _chi_to_r(k, k2chi):
+        """|chi(R)| via the same transform the provenance-tracked path uses."""
+        # k2chi already carries the k^2 weighting, so kweight=0 here.
+        result = xftf_arrays(k, k2chi, {**ft_dict, "kweight": 0})
+        return result["r"], result["chir_mag"]
 
     click.echo(
         f"\nTop {top_paths} paths (σ²_DW={sigma2_dw} Å², {n_total_frames} frames, "
         f"scored by freq × ∫|k²χ_path|dk):"
     )
-    for rank, (score, _key, g, _, freq) in enumerate(top, 1):
-        nleg_str = "SS" if g["nlegs"] == 2 else f"MS{g['nlegs']}"
+    for rank, (score, key, path, _k2chi, freq) in enumerate(top, 1):
         click.echo(
-            f"  {rank}. {nleg_str}  r={g['r_eff']:.3f} Å  "
-            f"deg={g['degeneracy']:.1f}  scatterer={g['scatterer']}  "
+            f"  {rank}. {key}  r={path.r_eff:.3f} Å  "
+            f"deg={path.degeneracy:.1f}  scatterer={path.scatterer}  "
             f"freq={freq:.0%}  score={score:.4f}"
         )
 
@@ -463,9 +383,9 @@ def main(
             label="snapshots" if i == 0 else None,
         )
     ax_k.plot(k_avg, k_avg**2 * chi_avg, color="steelblue", lw=2, label="ensemble avg", zorder=3)
-    for rank, (_score, _key, g, k2chi, freq) in enumerate(top):
-        nleg_str = "SS" if g["nlegs"] == 2 else f"MS{g['nlegs']}"
-        lbl = f"P{rank + 1}: {g['scatterer']} r={g['r_eff']:.2f}Å {nleg_str} ({freq:.0%})"
+    for rank, (_score, _key, path, k2chi, freq) in enumerate(top):
+        nleg_str = "SS" if path.nlegs == 2 else f"MS{path.nlegs}"
+        lbl = f"P{rank + 1}: {path.scatterer} r={path.r_eff:.2f}Å {nleg_str} ({freq:.0%})"
         ax_k.plot(
             k_avg,
             freq * k2chi,
@@ -485,10 +405,10 @@ def main(
     # Panel 2: |χ(R)| — ensemble avg (blue) + path |χ(R)| (dashed)
     ax_r = axes[1]
     ax_r.plot(r_larch, chir_larch, color="steelblue", lw=2, label="ensemble avg", zorder=3)
-    for rank, (_score, _key, g, k2chi, freq) in enumerate(top):
-        nleg_str = "SS" if g["nlegs"] == 2 else f"MS{g['nlegs']}"
-        lbl = f"P{rank + 1}: {g['scatterer']} r={g['r_eff']:.2f}Å {nleg_str}"
-        r_p, chir_p = _chi_to_r(k_avg, freq * k2chi, ft_kmin, ft_kmax)
+    for rank, (_score, _key, path, k2chi, freq) in enumerate(top):
+        nleg_str = "SS" if path.nlegs == 2 else f"MS{path.nlegs}"
+        lbl = f"P{rank + 1}: {path.scatterer} r={path.r_eff:.2f}Å {nleg_str}"
+        r_p, chir_p = _chi_to_r(k_avg, freq * k2chi)
         mask_r = r_p <= 6.5
         ax_r.plot(
             r_p[mask_r],

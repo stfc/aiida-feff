@@ -29,6 +29,41 @@ from aiida.orm import Dict
 VALID_EDGE_LABELS = frozenset({"K", "L1", "L2", "L3", "M1", "M2", "M3", "M4", "M5"})
 VALID_SPECTRUM_TYPES = frozenset({"EXAFS"})
 
+#: Every key this node understands.  Anything else is rejected by
+#: :meth:`FeffParameters.validate`, because a silently-ignored key produces a
+#: FEFF run with default settings while the user believes otherwise.
+VALID_KEYS = frozenset(
+    {
+        # calculation control
+        "edge",
+        "spectrum_type",
+        "radius",
+        "absorbing_atom",
+        "absorbing_atoms",
+        "exclude_hydrogen",
+        # FEFF cards
+        "s02",
+        "nleg",
+        "scf",
+        "exchange",
+        "control",
+        "print",
+        "exafs",
+        "criteria",
+        "delete_tags",
+    }
+)
+
+#: Keys people reach for that this node does not implement, mapped to the name
+#: that actually works.  Used to turn a silent no-op into a pointed error.
+_KEY_ALIASES = {
+    "calc_mode": "spectrum_type",
+    "rpath": "radius",
+    "cluster_radius": "radius",
+    "absorber": "absorbing_atom",
+    "amp_reduction": "s02",
+}
+
 
 class FeffParameters(Dict):
     """Typed :class:`~aiida.orm.Dict` for FEFF calculation parameters.
@@ -95,6 +130,8 @@ class FeffParameters(Dict):
         """Raise :exc:`ValueError` if the stored dict is invalid."""
         d = self.get_dict()
 
+        self._validate_keys(d)
+
         edge = d.get("edge")
         if edge is None:
             raise ValueError("'edge' is required")
@@ -112,6 +149,24 @@ class FeffParameters(Dict):
         s02 = d.get("s02")
         if s02 is not None and float(s02) < 0:
             raise ValueError(f"s02 must be >= 0, got {s02}")
+
+    @staticmethod
+    def _validate_keys(d: dict) -> None:
+        """Reject keys this node does not act on.
+
+        A key that is accepted but never read produces a FEFF run at default
+        settings while the caller believes their value took effect, so unknown
+        keys are an error rather than a warning.
+        """
+        unknown = sorted(set(d) - VALID_KEYS)
+        if not unknown:
+            return
+        hints = [f"{k!r} (did you mean {_KEY_ALIASES[k]!r}?)" for k in unknown if k in _KEY_ALIASES]
+        plain = [repr(k) for k in unknown if k not in _KEY_ALIASES]
+        raise ValueError(
+            f"Unknown FeffParameters key(s): {', '.join(hints + plain)}. "
+            f"Recognised keys: {sorted(VALID_KEYS)}"
+        )
 
     # ------------------------------------------------------------------
     # Convenience accessors
@@ -172,6 +227,22 @@ class FeffParameters(Dict):
             tags["_del"] = list(dict.fromkeys(del_list))  # dedup, preserve order
 
         return tags
+
+    def to_feff_cards(self) -> list[str]:
+        """Render the FEFF cards this node contributes, one string per line.
+
+        This is a *preview* of the ``PARAMETERS`` block only.  The full
+        ``feff.inp`` additionally needs a structure, because ``POTENTIALS`` and
+        ``ATOMS`` are generated from it by
+        :meth:`~aiida_feff.calculations.feff.FeffCalculation._build_feff_inp`.
+        """
+        tags = self.to_pymatgen_user_tags()
+        deleted = set(tags.pop("_del", []))
+
+        cards = [f"EDGE  {self.edge}", f"RPATH {self.radius}"]
+        cards += [f"{name:<6s}{value}" for name, value in tags.items() if name not in deleted]
+        cards += [f"* deleted: {name}" for name in sorted(deleted)]
+        return cards
 
 
 # ---------------------------------------------------------------------------

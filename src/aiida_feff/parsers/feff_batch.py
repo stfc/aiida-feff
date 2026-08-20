@@ -8,9 +8,15 @@ from aiida.engine import ExitCode
 from aiida.parsers import Parser
 from typing_extensions import Any
 
-from aiida_feff.calculations.feff import FEFF_CHI_FILE, FEFF_CONTRIBUTIONS_RAW, FEFF_XMUDA_FILE
+from aiida_feff.calculations.feff import (
+    FEFF_CHI_FILE,
+    FEFF_CONTRIBUTIONS_RAW,
+    FEFF_LOG_FILE,
+    FEFF_XMUDA_FILE,
+)
 from aiida_feff.calculations.feff_batch import _snap_label
-from aiida_feff.parsers.feff import _parse_xas
+from aiida_feff.parsers.feff import _parse_xas, excerpt_traceback
+from aiida_feff.versions import parse_feff_version
 
 
 class FeffBatchParser(Parser):
@@ -35,7 +41,7 @@ class FeffBatchParser(Parser):
         except Exception:  # noqa: BLE001
             tb = traceback.format_exc()
             self.logger.error("Batch parser raised an exception:\n%s", tb)
-            return self.exit_codes.ERROR_PARSING_FAILED.format(reason=tb[:200])  # type: ignore[no-any-return]
+            return self.exit_codes.ERROR_PARSING_FAILED.format(reason=excerpt_traceback(tb))  # type: ignore[no-any-return]
 
     # ------------------------------------------------------------------
 
@@ -59,6 +65,7 @@ class FeffBatchParser(Parser):
             store_paths = False
 
         n_ok = 0
+        feff_version: str | None = None
         for snap_dir in snap_dirs:
             frame_idx, site_idx = _parse_snap_dir_name(snap_dir)
             if frame_idx is None or site_idx is None:
@@ -83,7 +90,15 @@ class FeffBatchParser(Parser):
                     f"{snap_dir}/{FEFF_CHI_FILE}", mode="rb"
                 )
 
-            xas = _parse_xas(xmu_bytes, chi_bytes, logger=self.logger)
+            # Every run in a batch uses the same binary, so the banner is read
+            # once from whichever snapshot supplies it first.
+            if feff_version is None and FEFF_LOG_FILE in files_in_dir:
+                log_text = retrieved.base.repository.get_object_content(
+                    f"{snap_dir}/{FEFF_LOG_FILE}", mode="rb"
+                )
+                feff_version = parse_feff_version(log_text.decode("utf-8", errors="replace"))
+
+            xas = _parse_xas(xmu_bytes, chi_bytes, logger=self.logger, feff_version=feff_version)
             if xas is None:
                 self.logger.warning("%s: XAS parsing returned None; skipping", snap_dir)
                 continue

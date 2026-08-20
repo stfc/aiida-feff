@@ -16,11 +16,23 @@ from typing import Any
 import numpy as np
 from aiida.engine import calcfunction
 from aiida.orm import Dict, SinglefileData
-from scipy.constants import eV, hbar, m_e
 
+from aiida_feff.constants import HBAR2_OVER_2M_EV_ANGSTROM2
 from aiida_feff.data.xasdata import XasData
+from aiida_feff.versions import VERSIONS_ATTR, dependency_versions
 
-_HBAR2_OVER_2M_ELECTRON_EV_ANGSTROM2 = (hbar**2 / (2 * m_e)) * (1e20 / eV)
+#: Deprecated alias kept for callers that imported the old private name.
+_HBAR2_OVER_2M_ELECTRON_EV_ANGSTROM2 = HBAR2_OVER_2M_EV_ANGSTROM2
+
+
+def shifted_k_mask(k: np.ndarray, e0_shift: float) -> np.ndarray:
+    r"""Boolean mask of k points that survive a ΔE₀ shift.
+
+    ``k'^2 = k^2 - \Delta E_0 / (\hbar^2/2m_e)``; points where that is negative
+    lie below the shifted threshold and have no real wavenumber.
+    """
+    k = np.asarray(k, dtype=float)
+    return (k**2 - float(e0_shift) / HBAR2_OVER_2M_EV_ANGSTROM2) >= 0.0
 
 
 def scaled_chi_arrays(
@@ -30,17 +42,19 @@ def scaled_chi_arrays(
 
     ΔE₀ shifts the photoelectron energy using
     $E = \frac{\hbar^2}{2m_e} k^2$ in eV, with the conversion factor
-    represented by ``_HBAR2_OVER_2M_ELECTRON_EV_ANGSTROM2``. Points below the
-    shifted threshold are omitted so the returned k-grid remains monotonic and
+    :data:`~aiida_feff.constants.HBAR2_OVER_2M_EV_ANGSTROM2`. Points below the
+    shifted threshold are dropped so the returned k-grid remains monotonic and
     suitable for Larch Fourier transforms.
+
+    The returned arrays are therefore **shorter** than the inputs whenever
+    ``e0_shift > 0``; callers holding parallel k-indexed arrays must apply
+    :func:`shifted_k_mask` to those too.
     """
     k = np.asarray(k, dtype=float)
     chi = np.asarray(chi, dtype=float)
-    shifted_k_squared = k**2 - float(e0_shift) / _HBAR2_OVER_2M_ELECTRON_EV_ANGSTROM2
-    # Keep k=0 for an unshifted spectrum. Apart from preserving the original
-    # data grid, this keeps ensemble χ(k) uncertainty arrays aligned.
-    valid = shifted_k_squared >= 0.0
-    return np.sqrt(shifted_k_squared[valid]), float(s02) * chi[valid]
+    valid = shifted_k_mask(k, e0_shift)
+    shifted_k_squared = k[valid] ** 2 - float(e0_shift) / HBAR2_OVER_2M_EV_ANGSTROM2
+    return np.sqrt(shifted_k_squared), float(s02) * chi[valid]
 
 
 def list_experimental_groups(source: SinglefileData) -> list[str]:
@@ -95,7 +109,7 @@ def _import_experimental_spectrum_impl(path: str, parameters: dict[str, Any]) ->
         if len(groups) > 1:
             available = ", ".join(name for name in project.__dict__ if not name.startswith("_"))
             raise ValueError(
-                "Select one Athena group before importing. " f"Available groups: {available}"
+                f"Select one Athena group before importing. Available groups: {available}"
             )
         group = groups[0]
         reader_name = "read_athena"
@@ -133,8 +147,7 @@ def _xas_from_larch_group(group: Any, parameters: dict[str, Any], reader_name: s
     if (energy is None or mu is None) and (k is None or chi is None):
         available = ", ".join(getattr(group, "array_labels", [])) or "none"
         raise ValueError(
-            "Larch could not identify energy/mu or k/chi columns. "
-            f"Detected columns: {available}."
+            f"Larch could not identify energy/mu or k/chi columns. Detected columns: {available}."
         )
 
     out = XasData()
@@ -147,9 +160,9 @@ def _xas_from_larch_group(group: Any, parameters: dict[str, Any], reader_name: s
         )
     if k is not None and chi is not None:
         out.set_chi(k, chi)
-    out.base.extras.set("source_kind", "experimental")
-    out.base.extras.set("larch_reader", reader_name)
-    out.base.extras.set("larch_import_options", dict(parameters))
+    out.base.attributes.set("source_kind", "experimental")
+    out.base.attributes.set("larch_reader", reader_name)
+    out.base.attributes.set("larch_import_options", dict(parameters))
     return out
 
 
@@ -166,24 +179,42 @@ def _first_array(group: Any, *names: str) -> np.ndarray | None:
 
 @calcfunction
 def scale_simulated_spectrum(simulated: XasData, parameters: Dict) -> XasData:
-    """Store a provenance-linked, $S_0^2$/ΔE₀-scaled simulated spectrum."""
+    """Store a provenance-linked, $S_0^2$/ΔE₀-scaled simulated spectrum.
+
+    A positive ΔE₀ drops the lowest-k points, so every array indexed by k —
+    ``chi_k_std`` and any FT result carried on the node — is masked the same
+    way.  Leaving them at full length would produce a node whose arrays no
+    longer line up.
+    """
     options = parameters.get_dict()
-    out = XasData()
-    for name in simulated.get_arraynames():
-        out.set_array(name, simulated.get_array(name))
-    for key, value in simulated.base.extras.all.items():
-        out.base.extras.set(key, value)
-    if "k" not in simulated.get_arraynames() or "chi_k" not in simulated.get_arraynames():
+    names = set(simulated.get_arraynames())
+    if not {"k", "chi_k"} <= names:
         raise ValueError("Simulated spectrum has no χ(k) arrays to scale.")
-    k, chi = scaled_chi_arrays(
-        simulated.get_array("k"),
-        simulated.get_array("chi_k"),
-        float(options.get("s02", 1.0)),
-        float(options.get("e0_shift", 0.0)),
-    )
+
+    s02 = float(options.get("s02", 1.0))
+    e0_shift = float(options.get("e0_shift", 0.0))
+
+    k_in = simulated.get_array("k")
+    mask = shifted_k_mask(k_in, e0_shift)
+    n_k = len(k_in)
+
+    out = XasData()
+    for name in names:
+        if name in ("k", "chi_k"):
+            continue
+        array = simulated.get_array(name)
+        # Arrays sharing the k grid must be masked with it; arrays on the
+        # energy grid (or any other length) are copied unchanged.
+        out.set_array(name, array[mask] if array.shape[:1] == (n_k,) else array)
+
+    k, chi = scaled_chi_arrays(k_in, simulated.get_array("chi_k"), s02, e0_shift)
     out.set_chi(k, chi)
-    out.base.extras.set("comparison_s02", float(options.get("s02", 1.0)))
-    out.base.extras.set("comparison_e0_shift", float(options.get("e0_shift", 0.0)))
+
+    for key, value in simulated.base.attributes.all.items():
+        if not key.startswith("array|"):
+            out.base.attributes.set(key, value)
+    out.base.attributes.set("comparison_s02", s02)
+    out.base.attributes.set("comparison_e0_shift", e0_shift)
     return out
 
 
@@ -198,6 +229,7 @@ def import_experimental_spectrum(source: SinglefileData, parameters: Dict) -> Xa
     options = parameters.get_dict()
     with _source_path(source) as path:
         result = _import_experimental_spectrum_impl(path, options)
-    result.base.extras.set("source_file", source.filename)
-    result.base.extras.set("source_kind", "experimental")
+    result.base.attributes.set("source_file", source.filename)
+    result.base.attributes.set("source_kind", "experimental")
+    result.base.attributes.set(VERSIONS_ATTR, dependency_versions())
     return result

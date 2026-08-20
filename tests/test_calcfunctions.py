@@ -64,7 +64,7 @@ class TestAverageXasData:
 
         nodes = {f"snap_{i}": self._make_xas(float(i)) for i in range(5)}
         avg = _average_xas_data_impl(**nodes)
-        assert avg.base.extras.get("n_snapshots") == 5
+        assert avg.base.attributes.get("n_snapshots") == 5
 
     def test_empty_raises(self):
         from aiida_feff.calcfunctions.larch import _average_xas_data_impl

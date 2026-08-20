@@ -32,8 +32,7 @@ from __future__ import annotations
 import typing as t
 from typing import TYPE_CHECKING
 
-import numpy as np
-
+from aiida_feff.calcfunctions.larch import FT_DEFAULTS
 from aiida_feff.data.xasdata import XasData
 
 if TYPE_CHECKING:
@@ -178,8 +177,9 @@ def plot_chi_r(
 
     ft_params:
         FT parameters forwarded to larch ``xftf`` when *source* is an
-        ``XasData``.  Keys: ``kmin``, ``kmax``, ``kweight``, ``dk``, ``rmax``.
-        Ignored when *source* is an ``ArrayData`` FT-result node.
+        ``XasData``.  See
+        :data:`~aiida_feff.calcfunctions.larch.FT_DEFAULTS` for the keys and
+        their defaults.  Ignored when *source* is an ``ArrayData`` FT node.
     component:
         Which component to plot: ``"mag"`` (default), ``"re"``, or ``"im"``.
     ax:
@@ -198,12 +198,15 @@ def plot_chi_r(
 
     # -- resolve r / chir arrays --------------------------------------------
     if isinstance(source, XasData):
-        r, chir_mag, chir_re, chir_im = _xftf_inline(source, ft_params or {})
+        r, chir_mag, chir_re, chir_im, resolved_ft = _xftf_inline(source, ft_params or {})
     elif isinstance(source, ArrayData):
         r = source.get_array("r")
         chir_mag = source.get_array("chir_mag")
         chir_re = source.get_array("chir_re")
         chir_im = source.get_array("chir_im")
+        # chi_k_to_r records the transform it ran; fall back to the defaults
+        # for nodes produced before that was stored.
+        resolved_ft = source.base.attributes.get("fourier_params", dict(FT_DEFAULTS))
     else:
         raise TypeError(f"Expected XasData or ArrayData, got {type(source)}")
 
@@ -222,8 +225,11 @@ def plot_chi_r(
     ax.plot(r[mask], y[mask], label=_label)
 
     component_label = {"mag": "|χ(R)|", "re": "Re[χ(R)]", "im": "Im[χ(R)]"}[component]
+    # χ(R) from a k^n-weighted transform carries units of Å^-(n+1), so the
+    # axis label has to follow the kweight actually used.
+    kweight = int(resolved_ft.get("kweight", FT_DEFAULTS["kweight"]))
     ax.set_xlabel("R (Å)")
-    ax.set_ylabel(f"{component_label} (Å⁻³)")
+    ax.set_ylabel(f"{component_label} (Å$^{{-{kweight + 1}}}$)")
     ax.set_title("EXAFS χ(R)")
     ax.legend()
 
@@ -236,27 +242,18 @@ def plot_chi_r(
 
 
 def _xftf_inline(xas_data: XasData, ft_params: dict):
-    """Run larch xftf without the @calcfunction wrapper (no AiiDA tracking)."""
-    try:
-        import larch
-        from larch.xafs import xftf
-    except ImportError as exc:
-        raise ImportError(
-            "larch is required for on-the-fly FT.  Install with: pip install xraylarch"
-        ) from exc
+    """Fourier-transform without the @calcfunction wrapper (no AiiDA tracking).
 
-    k = xas_data.get_array("k")
-    chi = xas_data.get_array("chi_k")
+    Delegates to :func:`~aiida_feff.calcfunctions.larch.xftf_arrays` so a plot
+    and the provenance-tracked ``chi_k_to_r`` cannot disagree about FT defaults.
+    """
+    from aiida_feff.calcfunctions.larch import xftf_arrays
 
-    session = larch.Interpreter()
-    grp = larch.Group(k=k, chi=chi)
-    xftf(
-        grp,
-        kmin=ft_params.get("kmin", 3.0),
-        kmax=ft_params.get("kmax", 15.0),
-        kweight=ft_params.get("kweight", 2),
-        dk=ft_params.get("dk", 1.0),
-        rmax_out=ft_params.get("rmax", 8.0),
-        _larch=session,
+    result = xftf_arrays(xas_data.get_array("k"), xas_data.get_array("chi_k"), ft_params)
+    return (
+        result["r"],
+        result["chir_mag"],
+        result["chir_re"],
+        result["chir_im"],
+        result["ft_params"],
     )
-    return grp.r, np.abs(grp.chir), grp.chir.real, grp.chir.imag

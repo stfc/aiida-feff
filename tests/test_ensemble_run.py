@@ -27,17 +27,24 @@ FAKE_FEFF = textwrap.dedent("""\
     python3 - <<'PY'
     import math
     rows = []
+    chi_rows = []
     for i in range(120):
         omega = -20.0 + i * 2.0
         k = math.sqrt(max(omega, 0.0) * 0.2624684)
-        mu = 1.0 + 0.1 * math.sin(2 * k * 2.5) * math.exp(-0.05 * k * k)
+        chi = 0.1 * math.sin(2 * k * 2.5) * math.exp(-0.05 * k * k)
+        mu = 1.0 + chi
         rows.append(f"{omega:10.4f} {omega:10.4f} {k:10.4f} {mu:10.5f} {1.0:10.5f} {0.0:10.5f}")
+        chi_rows.append(f"{k:10.4f} {chi:12.6e} {abs(chi):12.6e} {0.0:10.4f}")
     header = [
         "# Feff8L (EXAFS)  0.1",
         "# e0 = 7112.00",
         "#   omega      e        k        mu       mu0      chi",
     ]
     open("xmu.dat", "w").write("\\n".join(header + rows) + "\\n")
+    # chi.dat is what the batch shard is built from, so the stand-in has to
+    # write it too or the batch tests silently skip the archive path.
+    chi_header = ["# Feff8L (EXAFS)  0.1", "#    k          chi          mag        phase"]
+    open("chi.dat", "w").write("\\n".join(chi_header + chi_rows) + "\\n")
     open("files.dat", "w").write("Feff8L (EXAFS)  0.1\\n")
     PY
     """)
@@ -226,6 +233,56 @@ class TestBatchMode:
         assert results["averaged_xas"]["all"].base.attributes.get("n_snapshots") == 3
         batch_children = [c for c in node.called if c.label.startswith("batch_")]
         assert len(batch_children) == 2
+
+    def test_batch_run_produces_a_consolidated_archive(
+        self, fake_feff_code, python_code, two_site_trajectory
+    ):
+        """Every batch shard must end up merged into the single 'archive' output (ADR 0004)."""
+        from aiida_feff.data.archive import ExafsArchiveData
+        from aiida_feff.data.parameters import FeffParameters
+
+        results, node = run_workchain(
+            code=fake_feff_code,
+            python_code=python_code,
+            trajectory=two_site_trajectory,
+            batch_size=orm.Int(2),
+            parameters=FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atom": 0}),
+        )
+        assert node.is_finished_ok, node.exit_message
+
+        # Each batch CalcJob emits its own shard...
+        shards = [c.outputs.archive for c in node.called if c.label.startswith("batch_")]
+        assert len(shards) == 2
+        assert all(s.is_shard for s in shards)
+
+        # ...and the workchain consolidates them into one ensemble archive.
+        archive = results["archive"]
+        assert isinstance(archive, ExafsArchiveData)
+        assert archive.is_ensemble
+        assert archive.k.size > 0
+        assert np.abs(archive.chi).max() > 0, "ensemble chi(k) is identically zero"
+
+        # The stand-in writes the same chi.dat for every snapshot, so averaging
+        # the shards must reproduce a single shard exactly — the merge must not
+        # dilute the mean with zero-filled or duplicated tasks.
+        np.testing.assert_allclose(archive.chi, shards[0].chi, atol=1e-6)
+
+        # Note: this is deliberately *not* compared against averaged_xas.  That
+        # output comes from larch's autobk on xmu.dat, whereas the archive comes
+        # from FEFF's own chi.dat; the two agree on real data but not on a
+        # synthetic mu(E).
+
+    def test_serial_path_reports_no_archive(self, fake_feff_code, two_site_trajectory):
+        """FeffCalculation writes no shard, so the serial path must not claim one."""
+        from aiida_feff.data.parameters import FeffParameters
+
+        results, node = run_workchain(
+            code=fake_feff_code,
+            trajectory=two_site_trajectory,
+            parameters=FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atom": 0}),
+        )
+        assert node.is_finished_ok, node.exit_message
+        assert "archive" not in results
 
     def test_batch_and_serial_paths_agree(self, fake_feff_code, python_code, two_site_trajectory):
         """Batching is a scheduling choice; it must not change the physics."""

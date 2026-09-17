@@ -275,6 +275,58 @@ def main() -> None:
                 file=sys.stderr,
             )
 
+    # ----------------------------------------------------------------
+    # Step 3: Write batch_shard.h5 (ADR 0002)
+    # ----------------------------------------------------------------
+    # md-exafs owns the shard format; we only ran FEFF. Delegating to
+    # ``write_batch_shard`` keeps a shard written here byte-compatible with one
+    # written by md-exafs' own BatchExecutor, including the default k-grid.
+    if successful:
+        try:
+            from md_exafs.execution import FeffTask, write_batch_shard
+
+            tasks = [
+                FeffTask(
+                    frame_idx=f,
+                    site_idx=s,
+                    input_dir=Path(snap_label(f, s)),
+                    absorber_element=config.get("absorber_element", ""),
+                )
+                for f, s in pairs
+                if snap_label(f, s) in successful
+            ]
+            _, n_written = write_batch_shard(
+                tasks,
+                "batch_shard.h5",
+                threshold=float(config.get("threshold", 0.0)),
+                store_paths=do_aggregate,
+            )
+            print(
+                f"SHARD OK  batch_shard.h5 written ({n_written}/{len(tasks)} tasks)",
+                file=sys.stderr,
+            )
+            if n_written == 0:
+                # An empty shard cannot be merged and is not worth retrieving;
+                # drop it so the workchain sees "no archive" rather than "archive
+                # containing nothing".
+                Path("batch_shard.h5").unlink(missing_ok=True)
+                print(
+                    "Warning: no task produced a parseable chi.dat; batch_shard.h5 not written",
+                    file=sys.stderr,
+                )
+            elif n_written < len(tasks):
+                # Not fatal: the parser reports it via n_failed. But say so loudly,
+                # because a shard silently short of tasks is easy to average over
+                # without noticing.
+                print(
+                    f"Warning: {len(tasks) - n_written} task(s) ran but produced no "
+                    "parseable chi.dat and were omitted from batch_shard.h5",
+                    file=sys.stderr,
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: Failed to construct batch_shard.h5: {exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+
     # Partial failure is normal in an MD ensemble and the parser handles it.
     # A batch where nothing ran is a job failure, and saying so through the
     # exit status makes it visible to the scheduler as well as the parser.

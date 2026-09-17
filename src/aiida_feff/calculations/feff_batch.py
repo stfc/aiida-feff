@@ -43,6 +43,7 @@ from aiida_feff.calculations.feff import (
     absorber_element,
     as_lf_bytes,
 )
+from aiida_feff.data.archive import ExafsArchiveData
 from aiida_feff.data.parameters import FeffParameters
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ BATCH_ERR = "batch_err.log"
 
 # Retrieve glob patterns for per-run outputs (depth=None preserves directory structure)
 _SNAP_RETRIEVE = [
+    ("batch_shard.h5", ".", 0),
     (f"snap_*/{FEFF_XMUDA_FILE}", ".", None),
     (f"snap_*/{FEFF_CHI_FILE}", ".", None),
     (f"snap_*/{FEFF_PATHS_FILE}", ".", None),
@@ -173,6 +175,12 @@ class FeffBatchCalculation(CalcJob):
             dynamic=True,
             required=False,
             help="PathContributionsData nodes keyed snap_FFFF_site_SSSS.",
+        )
+        spec.output(
+            "archive",
+            valid_type=ExafsArchiveData,
+            required=False,
+            help="Batch shard archive node (batch_shard.h5) (ADR 0004).",
         )
 
         spec.exit_code(400, "ERROR_PARSING_FAILED", message="Batch parser raised: {reason}.")

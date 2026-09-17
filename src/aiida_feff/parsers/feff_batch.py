@@ -49,10 +49,24 @@ class FeffBatchParser(Parser):
         retrieved = self.retrieved
         top_names = retrieved.base.repository.list_object_names()
 
+        has_shard = "batch_shard.h5" in top_names
+        if has_shard:
+            from aiida_feff.data.archive import ExafsArchiveData
+
+            # as_path() materialises the object without pulling the whole shard
+            # into memory first; ExafsArchiveData copies it back into its own
+            # repository before the context exits.
+            with retrieved.base.repository.as_path("batch_shard.h5") as shard_path:
+                self.out("archive", ExafsArchiveData(file=str(shard_path)))
+
         # Collect all snap_* subdirectories present in the retrieved folder
         snap_dirs = sorted(n for n in top_names if n.startswith("snap_"))
 
         if not snap_dirs:
+            if has_shard:
+                # The shard is the authoritative output; per-snapshot directories
+                # are a legacy convenience, so their absence is not an error.
+                return ExitCode(0)
             self.logger.error(
                 "No snap_* directories found in retrieved folder; "
                 "the driver may have failed entirely. Check batch_err.log."

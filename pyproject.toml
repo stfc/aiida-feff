@@ -64,6 +64,7 @@ Tracker = "https://github.com/stfc/aiida-feff/issues"
 "feff.parameters"      = "aiida_feff.data.parameters:FeffParameters"
 "feff.xasdata"         = "aiida_feff.data.xasdata:XasData"
 "feff.pathcontributions" = "aiida_feff.data.pathcontributions:PathContributionsData"
+"feff.archive"         = "aiida_feff.data.archive:ExafsArchiveData"
 
 [project.entry-points."aiida.workflows"]
 "feff.ensemble" = "aiida_feff.workflows.ensemble:EnsembleExafsWorkChain"

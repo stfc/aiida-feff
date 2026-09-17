@@ -41,10 +41,12 @@ from aiida import orm
 from aiida.engine import ToContext, WorkChain, if_
 from aiida.engine.processes.ports import PORT_NAMESPACE_SEPARATOR
 
+from aiida_feff.calcfunctions.archive import merge_exafs_shards
 from aiida_feff.calcfunctions.larch import average_xas_data
 from aiida_feff.calcfunctions.path_contributions import merge_path_contributions
 from aiida_feff.calculations.feff import CONTROL_NO_POT, CONTROL_POT_ONLY, FeffCalculation
 from aiida_feff.calculations.feff_batch import FeffBatchCalculation, _snap_label
+from aiida_feff.data.archive import ExafsArchiveData
 from aiida_feff.data.parameters import FeffParameters
 from aiida_feff.data.pathcontributions import PathContributionsData
 from aiida_feff.data.xasdata import XasData
@@ -62,11 +64,48 @@ logger = logging.getLogger(__name__)
 _LARGE_N_SITES = 20
 
 
+def _reject_negative_indices(spec: int | str | list) -> None:
+    """Raise if an absorber spec contains a negative absolute index.
+
+    md-exafs resolves negative indices with Python semantics, which is convenient
+    on a command line but wrong for a provenance-tracked input: the stored spec
+    would no longer identify the site that was computed.
+    """
+    if isinstance(spec, bool):
+        raise ValueError(f"absorbing_atoms must be int, str, or list[int]; got {type(spec)}")
+    if isinstance(spec, int):
+        candidates: list[int] = [spec]
+    elif isinstance(spec, list | tuple):
+        candidates = [int(x) for x in spec]
+    elif isinstance(spec, str) and ":" not in spec:
+        parts = [part.strip() for part in spec.split(",") if part.strip()]
+        try:
+            # Only an all-integer spec is an index list; anything else is an
+            # element symbol and has no indices to check.
+            candidates = [int(part) for part in parts]
+        except ValueError:
+            candidates = []
+    else:
+        candidates = []
+
+    negative = [i for i in candidates if i < 0]
+    if negative:
+        raise ValueError(
+            f"Absorber indices must be non-negative; got {negative}. "
+            "Negative (Python-style) indexing is rejected because the stored "
+            "input would not identify the site that was computed."
+        )
+
+
 def _resolve_absorber_sites(
     structure: orm.StructureData,
     spec: int | str | list,
 ) -> list[int]:
     """Resolve absorber specification to a validated list of 0-based atom indices.
+
+    Delegates the resolution itself to :func:`md_exafs.resolve_frame_absorbers`
+    (ADR 0008) so that the plugin and the core engine agree on what a given
+    specification means.
 
     Accepted formats (all validated to be single-species):
 
@@ -75,7 +114,11 @@ def _resolve_absorber_sites(
     - ``"Cu"``           -- element symbol → all matching indices
     - ``"0,1,2"``        -- comma-separated absolute indices as a string
     - ``"Cu:0,1"``       -- element symbol + relative indices within that element
-                           (e.g. ``"Cu:0,1"`` → 1st and 2nd Cu atoms)
+                            (e.g. ``"Cu:0,1"`` → 1st and 2nd Cu atoms)
+
+    Unlike bare md-exafs, **negative indices are rejected**.  The specification is
+    stored verbatim in the provenance graph, so ``-1`` would record an input that
+    does not match the site actually computed.
 
     Parameters
     ----------
@@ -92,72 +135,16 @@ def _resolve_absorber_sites(
     Raises:
     ------
     ValueError
-        If indices are out of range, empty, the spec is ambiguous, or
-        the selected atoms belong to more than one element.
+        If indices are negative or out of range, the spec is empty or ambiguous,
+        or the selected atoms belong to more than one element.
     """
+    from md_exafs.selection import resolve_frame_absorbers
+
+    _reject_negative_indices(spec)
+
     pmg_structure = structure.get_pymatgen_structure()
     symbols = [site.species_string for site in pmg_structure.sites]
-    n = len(symbols)
-
-    if isinstance(spec, int):
-        indices = [spec]
-
-    elif isinstance(spec, list):
-        if not spec:
-            raise ValueError("absorbing_atoms list must not be empty.")
-        indices = [int(x) for x in spec]
-
-    elif isinstance(spec, str):
-        spec = spec.strip()
-
-        if ":" in spec:
-            # "Cu:0,1" — relative indices within the element's sites
-            element_part, idx_part = spec.split(":", 1)
-            element = element_part.strip().capitalize()
-            element_indices = [i for i, s in enumerate(symbols) if s == element]
-            if not element_indices:
-                raise ValueError(f"No atoms with element {element!r} found in structure.")
-            try:
-                rel = [int(x.strip()) for x in idx_part.split(",")]
-            except ValueError as exc:
-                raise ValueError(
-                    f"Invalid absorber format {spec!r}. "
-                    "Use 'Element:rel0,rel1' with integer relative indices."
-                ) from exc
-            bad_rel = [r for r in rel if not 0 <= r < len(element_indices)]
-            if bad_rel:
-                raise ValueError(
-                    f"Relative indices {bad_rel} out of range for element {element!r} "
-                    f"(0–{len(element_indices) - 1})."
-                )
-            indices = [element_indices[r] for r in rel]
-
-        elif spec.replace(",", "").replace(" ", "").isdigit():
-            # "0,1,2" — comma-separated absolute indices
-            indices = [int(x.strip()) for x in spec.split(",")]
-
-        else:
-            # Element symbol → all matching sites
-            element = spec.capitalize()
-            indices = [i for i, s in enumerate(symbols) if s == element]
-            if not indices:
-                raise ValueError(f"No atoms with element {element!r} found in structure.")
-
-    else:
-        raise ValueError(f"absorbing_atoms must be int, str, or list[int]; got {type(spec)}")
-
-    for idx in indices:
-        if not 0 <= idx < n:
-            raise ValueError(f"Absorber index {idx} out of range (0–{n - 1}).")
-
-    # Single-species check
-    element = symbols[indices[0]]
-    bad = [idx for idx in indices if symbols[idx] != element]
-    if bad:
-        raise ValueError(
-            f"All absorber indices must be the same element ({element!r}). "
-            f"Indices {bad} are {[symbols[i] for i in bad]}."
-        )
+    indices = resolve_frame_absorbers(symbols, spec)
 
     if len(indices) > _LARGE_N_SITES:
         logger.warning(
@@ -407,6 +394,12 @@ class EnsembleExafsWorkChain(WorkChain):
             valid_type=PathContributionsData,
             required=False,
             help="Merged per-path FEFF data from all successful snapshots.",
+        )
+        spec.output(
+            "archive",
+            valid_type=ExafsArchiveData,
+            required=False,
+            help="Consolidated ensemble archive containing averaged spectra and paths (ADR 0004).",
         )
 
         spec.exit_code(300, "ERROR_ALL_FAILED", message="All snapshot FEFF calculations failed.")
@@ -677,6 +670,7 @@ class EnsembleExafsWorkChain(WorkChain):
         per_site: dict[int, dict[str, XasData]] = {s: {} for s in self.ctx.site_indices}
         all_xas: dict[str, XasData] = {}
         successful_paths: dict[str, PathContributionsData] = {}
+        shards: dict[str, ExafsArchiveData] = {}
         n_failed = 0
 
         for batch_label, chunk in self.ctx.batch_chunks.items():
@@ -694,6 +688,14 @@ class EnsembleExafsWorkChain(WorkChain):
             # each namespace once rather than once per pair.
             child_xas = dynamic_outputs(child, "xas_data")
             child_paths = dynamic_outputs(child, "path_contributions")
+
+            if "archive" in child.outputs:
+                shards[batch_label] = child.outputs.archive
+            else:
+                self.report(
+                    f"{batch_label} ({child.pk}) produced no batch_shard.h5; the "
+                    "consolidated 'archive' output will be incomplete."
+                )
 
             for frame_idx, site_idx in chunk:
                 label = _snap_label(frame_idx, site_idx)
@@ -716,6 +718,7 @@ class EnsembleExafsWorkChain(WorkChain):
         self.ctx.all_xas = all_xas
         self.ctx.successful_paths = successful_paths
         self.ctx.n_failed = n_failed
+        self.ctx.shards = shards
 
     def submit_feff_calculations(self):
         """Fan out: submit one FeffCalculation per (frame, site) pair."""
@@ -802,6 +805,9 @@ class EnsembleExafsWorkChain(WorkChain):
         self.ctx.all_xas = all_xas
         self.ctx.successful_paths = successful_paths
         self.ctx.n_failed = n_failed
+        # FeffCalculation writes no batch_shard.h5, so the consolidated 'archive'
+        # output is only produced on the batch path.
+        self.ctx.shards = {}
 
     def average_results(self) -> None:
         """Produce per-site and grand-average XasData outputs."""
@@ -843,6 +849,24 @@ class EnsembleExafsWorkChain(WorkChain):
                 **self.ctx.successful_paths,
             )
             self.out("path_contributions", merged)
+
+        # Consolidate the per-batch shards into one ensemble archive (ADR 0004).
+        # This is the node downstream tooling reads; the XasData / PathContributions
+        # outputs above are kept for backwards compatibility.
+        if self.ctx.shards:
+            ensemble_archive = merge_exafs_shards(
+                metadata={
+                    "call_link_label": "merge_shards",
+                    "label": "ensemble_archive",
+                },
+                **self.ctx.shards,
+            )
+            self.out("archive", ensemble_archive)
+        else:
+            self.report(
+                "No batch shards available; the 'archive' output was not produced. "
+                "Consolidated archives are only written by the batch execution path."
+            )
 
         if "group_label" in self.inputs:
             label = self.inputs.group_label.value

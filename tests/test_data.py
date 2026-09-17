@@ -1,6 +1,7 @@
 """Tests for FeffParameters and XasData data nodes."""
 
 import pytest
+from aiida import orm
 
 from aiida_feff.data.parameters import FeffParameters
 
@@ -163,6 +164,18 @@ class TestResolveAbsorberSites:
         with pytest.raises(ValueError, match="must not be empty"):
             _resolve_absorber_sites(cu_structure, [])
 
+    @pytest.mark.parametrize("spec", [-1, [0, -1], "-1", "0,-2"])
+    def test_negative_indices_rejected(self, cu_structure, spec):
+        """md-exafs resolves ``-1`` Python-style; a provenance graph must not.
+
+        The specification is what gets stored, so accepting ``-1`` would record an
+        input that does not identify the site actually computed.
+        """
+        from aiida_feff.workflows.ensemble import _resolve_absorber_sites
+
+        with pytest.raises(ValueError, match="non-negative"):
+            _resolve_absorber_sites(cu_structure, spec)
+
 
 class TestFeffParametersKeyValidation:
     """An accepted-but-ignored key produces a default FEFF run silently."""
@@ -219,3 +232,110 @@ class TestFeffParametersCards:
         cards = FeffParameters(dict={"edge": "K", "scf": None}).to_feff_cards()
         assert not any(card.startswith("SCF ") for card in cards)
         assert any(card.startswith("*") and "SCF" in card for card in cards)
+
+
+class TestExafsArchiveData:
+    """Tests for ExafsArchiveData node (ADR 0004)."""
+
+    def test_archive_from_batch_shard(self, tmp_path):
+        import numpy as np
+        from md_exafs.hdf5 import BatchShardWriter
+        from md_exafs.paths import PathResult
+
+        from aiida_feff.data.archive import ExafsArchiveData
+
+        shard_path = tmp_path / "batch_shard.h5"
+        k_grid = np.linspace(2.0, 15.0, 100)
+        chi = np.sin(k_grid)
+
+        p = PathResult(
+            frame_idx=0,
+            site_idx=0,
+            r_eff=2.5,
+            nlegs=2,
+            degeneracy=12.0,
+            scatterer="Cu",
+            cw_ratio=100.0,
+            k=np.linspace(0.0, 20.0, 20),
+            feff_data=np.ones((20, 6)),
+        )
+
+        with BatchShardWriter(shard_path, k_grid=k_grid) as w:
+            w.add_task_result(frame_idx=0, site_idx=0, absorber_element="Cu", chi=chi, paths=[p])
+
+        node = ExafsArchiveData(file=str(shard_path))
+        assert node.is_shard
+        assert not node.is_ensemble
+        assert np.allclose(node.k, k_grid)
+        assert np.allclose(node.chi, chi, atol=1e-5)
+
+        paths = node.iter_paths()
+        assert len(paths) == 1
+        assert paths[0].scatterer == "Cu"
+
+        xas = node.to_xas_data()
+        assert np.allclose(xas.k, k_grid)
+        assert np.allclose(xas.chi_k, chi, atol=1e-5)
+
+    def test_archive_reads_after_the_source_file_is_gone(self, tmp_path):
+        """A stored node must be readable from the repository alone.
+
+        The node's contents live in the AiiDA repository, so reads have to
+        materialise a local copy.  Doing that inside ``as_path()`` and handing the
+        path out afterwards leaves a dangling reader, which only shows up once the
+        original file no longer exists — as is the case for any node loaded in a
+        later session.
+        """
+        import numpy as np
+        from md_exafs.hdf5 import BatchShardWriter
+
+        from aiida_feff.data.archive import ExafsArchiveData
+
+        shard_path = tmp_path / "batch_shard.h5"
+        k_grid = np.linspace(2.0, 15.0, 50)
+        chi = np.cos(k_grid)
+        with BatchShardWriter(shard_path, k_grid=k_grid) as w:
+            w.add_task_result(frame_idx=0, site_idx=0, absorber_element="Cu", chi=chi)
+
+        node = ExafsArchiveData(file=str(shard_path)).store()
+        shard_path.unlink()
+
+        reloaded = orm.load_node(node.pk)
+        assert reloaded.is_shard
+        assert np.allclose(reloaded.chi, chi, atol=1e-5)
+
+        # The explicit reader must stay valid for the whole with-block.
+        with reloaded.reader() as archive:
+            assert np.allclose(archive.k, k_grid)
+            assert np.allclose(archive.chi, chi, atol=1e-5)
+
+    def test_archive_extracts_the_repository_file_only_once(self, tmp_path):
+        """Reading several attributes must not re-copy the whole HDF5 each time."""
+        import numpy as np
+        from md_exafs.hdf5 import BatchShardWriter
+
+        from aiida_feff.data.archive import ExafsArchiveData
+
+        shard_path = tmp_path / "batch_shard.h5"
+        k_grid = np.linspace(2.0, 15.0, 50)
+        with BatchShardWriter(shard_path, k_grid=k_grid) as w:
+            w.add_task_result(frame_idx=0, site_idx=0, absorber_element="Cu", chi=np.cos(k_grid))
+
+        node = ExafsArchiveData(file=str(shard_path)).store()
+
+        calls = 0
+        original = type(node).as_path
+
+        def counting_as_path(self):
+            nonlocal calls
+            calls += 1
+            return original(self)
+
+        monkeypatched = type(node)
+        monkeypatched.as_path = counting_as_path
+        try:
+            _ = node.k, node.chi, node.is_shard, node.r
+        finally:
+            monkeypatched.as_path = original
+
+        assert calls == 1, f"archive was extracted {calls} times for four attribute reads"

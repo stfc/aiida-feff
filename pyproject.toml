@@ -26,6 +26,7 @@ dependencies = [
     "ase>=3.22",
     "xraylarch>=0.9.80",
     "h5py>=3.0",
+    "md-exafs>=0.2.0",
 ]
 
 [project.optional-dependencies]

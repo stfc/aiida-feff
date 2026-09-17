@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 from aiida.engine import calcfunction
 from aiida.orm import Dict, SinglefileData
+from md_exafs.experimental import scaled_chi_arrays, shifted_k_mask
 
 from aiida_feff.constants import HBAR2_OVER_2M_EV_ANGSTROM2
 from aiida_feff.data.xasdata import XasData
@@ -23,38 +24,6 @@ from aiida_feff.versions import VERSIONS_ATTR, dependency_versions
 
 #: Deprecated alias kept for callers that imported the old private name.
 _HBAR2_OVER_2M_ELECTRON_EV_ANGSTROM2 = HBAR2_OVER_2M_EV_ANGSTROM2
-
-
-def shifted_k_mask(k: np.ndarray, e0_shift: float) -> np.ndarray:
-    r"""Boolean mask of k points that survive a ΔE₀ shift.
-
-    ``k'^2 = k^2 - \Delta E_0 / (\hbar^2/2m_e)``; points where that is negative
-    lie below the shifted threshold and have no real wavenumber.
-    """
-    k = np.asarray(k, dtype=float)
-    return (k**2 - float(e0_shift) / HBAR2_OVER_2M_EV_ANGSTROM2) >= 0.0
-
-
-def scaled_chi_arrays(
-    k: np.ndarray, chi: np.ndarray, s02: float = 1.0, e0_shift: float = 0.0
-) -> tuple[np.ndarray, np.ndarray]:
-    r"""Apply comparison-only $S_0^2$ and ΔE₀ adjustments to χ(k).
-
-    ΔE₀ shifts the photoelectron energy using
-    $E = \frac{\hbar^2}{2m_e} k^2$ in eV, with the conversion factor
-    :data:`~aiida_feff.constants.HBAR2_OVER_2M_EV_ANGSTROM2`. Points below the
-    shifted threshold are dropped so the returned k-grid remains monotonic and
-    suitable for Larch Fourier transforms.
-
-    The returned arrays are therefore **shorter** than the inputs whenever
-    ``e0_shift > 0``; callers holding parallel k-indexed arrays must apply
-    :func:`shifted_k_mask` to those too.
-    """
-    k = np.asarray(k, dtype=float)
-    chi = np.asarray(chi, dtype=float)
-    valid = shifted_k_mask(k, e0_shift)
-    shifted_k_squared = k[valid] ** 2 - float(e0_shift) / HBAR2_OVER_2M_EV_ANGSTROM2
-    return np.sqrt(shifted_k_squared), float(s02) * chi[valid]
 
 
 def list_experimental_groups(source: SinglefileData) -> list[str]:

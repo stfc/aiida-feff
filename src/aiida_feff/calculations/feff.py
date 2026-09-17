@@ -10,7 +10,6 @@ from pathlib import Path
 from aiida import orm
 from aiida.common import CalcInfo, CodeInfo, datastructures
 from aiida.engine import CalcJob, CalcJobProcessSpec
-from pymatgen.core import Structure
 
 from aiida_feff.data.parameters import FeffParameters
 from aiida_feff.data.pathcontributions import PathContributionsData
@@ -483,66 +482,19 @@ class FeffCalculation(CalcJob):
         structure: orm.StructureData,
         parameters: FeffParameters,
     ) -> str:
-        """Construct the full text of ``feff.inp`` from AiiDA objects.
+        """Construct the full text of ``feff.inp`` from AiiDA objects delegating to md_exafs."""
+        from md_exafs.feff_input import build_feff_inp as core_build_feff_inp
 
-        Public because :class:`~aiida_feff.calculations.feff_batch.FeffBatchCalculation`
-        generates the same input for every pair in a batch.
+        cfg = parameters.to_feff_config()
+        user_tags = parameters.to_pymatgen_user_tags()
+        if "_del" in user_tags:
+            cfg.delete_tags = list(user_tags["_del"])
 
-        The card content comes from pymatgen's ``MPEXAFSSet``, whose defaults
-        live in an unversioned ``MPEXAFSSet.yaml`` shipped inside pymatgen — a
-        pymatgen upgrade can therefore change every generated input.  The
-        pymatgen version in use is recorded on the calcjob node.
-        """
-        from pymatgen.io.feff.sets import MPEXAFSSet
-
-        absorbing_idx = parameters.get("absorbing_atom", 0)
-        exclude_h = bool(parameters.get("exclude_hydrogen", False))
-
-        pmg_structure: Structure = structure.get_pymatgen_structure()
-
-        if exclude_h:
-            symbols = [site.species_string for site in pmg_structure.sites]
-            non_h = [i for i, sym in enumerate(symbols) if sym != "H"]
-            if absorbing_idx not in non_h:
-                raise ValueError(
-                    f"absorbing_atom index {absorbing_idx} is a hydrogen atom "
-                    "but exclude_hydrogen=True."
-                )
-            absorbing_idx = non_h.index(absorbing_idx)
-            pmg_structure.remove_sites([i for i, sym in enumerate(symbols) if sym == "H"])
-
-        user_settings = parameters.to_pymatgen_user_tags()
-        user_settings["RPATH"] = str(parameters.radius)
-
-        del_value = user_settings.pop("_del", None)
-        del_list: list[str] = []
-        if del_value is None:
-            pass
-        elif isinstance(del_value, str):
-            del_list = [del_value]
-        else:
-            del_list = list(del_value)
-
-        # FEFF8L rejects the COREHOLE card that MPEXAFSSet.yaml always emits,
-        # so it is stripped unconditionally.  Consequence: core-hole treatment
-        # is unreachable through this plugin while FEFF8L is the target.
-        for kw in ("COREHOLE", "COREHOLE FSR"):
-            if kw not in del_list:
-                del_list.append(kw)
-        if del_list:
-            user_settings["_del"] = del_list
-
+        absorbing_idx = int(parameters.get("absorbing_atom", 0))
         with _spglib_new_error_handling():
-            feff_set = MPEXAFSSet(
-                absorbing_atom=absorbing_idx,
-                structure=pmg_structure,
-                edge=parameters.edge,
-                radius=parameters.radius,
-                user_tag_settings=user_settings,
+            inp_text = core_build_feff_inp(
+                structure.get_pymatgen_structure(),
+                config=cfg,
+                absorber_idx=absorbing_idx,
             )
-            feff = feff_set.all_input()
-
-        blocks = [
-            str(feff[k]) for k in ["HEADER", "PARAMETERS", "POTENTIALS", "ATOMS"] if k in feff
-        ]
-        return "\n\n".join([_generator_banner(), *blocks])
+        return _generator_banner() + "\n\n" + inp_text

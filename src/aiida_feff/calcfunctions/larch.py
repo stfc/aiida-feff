@@ -20,78 +20,19 @@ from __future__ import annotations
 import numpy as np
 from aiida.engine import calcfunction
 from aiida.orm import ArrayData, Dict
+from md_exafs.spectra import FT_DEFAULTS, resolve_ft_params, xftf_arrays
 
 from aiida_feff.data.xasdata import XasData
 from aiida_feff.versions import VERSIONS_ATTR, dependency_versions
 
-# ---------------------------------------------------------------------------
-# Fourier transform — single source of truth for FT defaults
-# ---------------------------------------------------------------------------
-
-#: Defaults applied by :func:`xftf_arrays` when a key is absent.  ``window``
-#: is listed explicitly because larch's own default is Kaiser–Bessel, not the
-#: Hanning window EXAFS documentation often assumes.
-FT_DEFAULTS: dict = {
-    "kmin": 3.0,
-    "kmax": 15.0,
-    "kweight": 2,
-    "dk": 1.0,
-    "rmax": 8.0,
-    "window": "kaiser",
-}
-
-
-def resolve_ft_params(ft_params: dict | None) -> dict:
-    """Fill *ft_params* with :data:`FT_DEFAULTS` and reject unknown keys."""
-    p = dict(ft_params or {})
-    unknown = sorted(set(p) - set(FT_DEFAULTS))
-    if unknown:
-        raise ValueError(
-            f"Unknown Fourier-transform parameter(s): {unknown}. "
-            f"Recognised keys: {sorted(FT_DEFAULTS)}"
-        )
-    return {**FT_DEFAULTS, **p}
-
-
-def xftf_arrays(k: np.ndarray, chi: np.ndarray, ft_params: dict | None = None) -> dict:
-    """Fourier-transform χ(k) → χ(R) and return plain numpy arrays.
-
-    Args:
-        k: Photoelectron wavenumber grid (Å⁻¹).
-        chi: χ(k) on that grid.
-        ft_params: Any subset of :data:`FT_DEFAULTS`.
-
-    Returns:
-        Dict with keys ``r``, ``chir_mag``, ``chir_re``, ``chir_im`` and
-        ``ft_params`` (the fully-resolved parameters actually used).
-    """
-    try:
-        from larch import Group
-        from larch.xafs import xftf
-    except ImportError as exc:
-        raise ImportError(
-            "larch is required for the Fourier transform.  Install with: pip install xraylarch"
-        ) from exc
-
-    p = resolve_ft_params(ft_params)
-    grp = Group(k=np.asarray(k, dtype=float), chi=np.asarray(chi, dtype=float))
-    xftf(
-        grp,
-        kmin=p["kmin"],
-        kmax=p["kmax"],
-        kweight=p["kweight"],
-        dk=p["dk"],
-        window=p["window"],
-        rmax_out=p["rmax"],
-    )
-    return {
-        "r": grp.r,
-        "chir_mag": np.abs(grp.chir),
-        "chir_re": grp.chir.real,
-        "chir_im": grp.chir.imag,
-        "ft_params": p,
-    }
-
+__all__ = [
+    "FT_DEFAULTS",
+    "resolve_ft_params",
+    "xftf_arrays",
+    "average_xas_data",
+    "tag_averaged_xas",
+    "chi_k_to_r",
+]
 
 # ---------------------------------------------------------------------------
 # Ensemble averaging

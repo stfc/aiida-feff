@@ -5,7 +5,26 @@ on:
     types: [published]
 
 jobs:
+  # The release path used to publish without running anything. A tag could
+  # therefore ship a commit whose CI never passed, or passed before a later
+  # force-push. Tests run here before the artefacts are built.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - run: uv sync --locked --extra testing --extra plots
+      - run: uv run pytest tests -q
+
   pypi:
+    needs: test
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -13,8 +32,10 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      # Versions kept in step with ci.yml; these previously lagged at v4/v6,
+      # so the one workflow that ships artefacts ran the oldest toolchain.
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
       - name: Check the tag matches the version in pyproject.toml

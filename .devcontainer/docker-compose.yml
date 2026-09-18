@@ -1,44 +1,45 @@
+# Development environment for aiida-feff.
+#
+# Storage is core.sqlite_dos, matching the test suite (which uses
+# aiida.tools.pytest_fixtures, itself sqlite-backed). PostgreSQL is therefore
+# not needed by anything in this repository and is no longer started: it cost
+# a service, a volume, eight environment variables and a schema-reset step
+# that could destroy a developer's data on rebuild.
+#
+# RabbitMQ *is* kept, because examples/example_ensemble.py calls
+# aiida.engine.submit, which needs a broker and a running daemon.
+#
+# Images are digest-pinned so a rebuild reproduces the same environment.
+# Dependabot's "docker" ecosystem updates the digests; do not replace them
+# with floating tags.
 services:
 
   app:
-    image: mcr.microsoft.com/devcontainers/python:3.12
-    userns_mode: keep-id
+    # mcr.microsoft.com/devcontainers/python:3.12
+    image: mcr.microsoft.com/devcontainers/python@sha256:a00123df1ec4af04b4013fda8c27438b73b1817a24f6bcd3d61e2f6aa0800302
     volumes:
       - ..:/workspace:cached
-      - aiida-repository:/tmp/aiida-feff-repository
+      # The virtualenv lives in a named volume rather than inside the bind
+      # mount. Sharing .venv with the host means the container may inherit an
+      # interpreter built for the host's OS and Python version (this repo is
+      # developed on macOS, and the image is Linux), and it also means opening
+      # the container mutates the host's working environment.
+      - venv:/workspace/.venv
+      - aiida-config:/home/vscode/.aiida
+      - aiida-repository:/home/vscode/.aiida/repository
     environment:
-      AIIDA_DB_HOST: postgres
-      AIIDA_DB_PORT: "5432"
-      AIIDA_DB_NAME: aiida
-      AIIDA_DB_USER: aiida
-      AIIDA_DB_PASS: aiida
       AIIDA_BROKER_HOST: rabbitmq
       AIIDA_BROKER_PORT: "5672"
       AIIDA_BROKER_USER: guest
       AIIDA_BROKER_PASS: guest
     depends_on:
-      postgres:
-        condition: service_healthy
       rabbitmq:
         condition: service_healthy
     command: sleep infinity
 
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: aiida
-      POSTGRES_USER: aiida
-      POSTGRES_PASSWORD: aiida
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U aiida"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   rabbitmq:
-    image: rabbitmq:3.13-alpine
+    # rabbitmq:3.13-alpine
+    image: rabbitmq@sha256:d7af1c87c5f1eda13fcfca06db452bf3aeab6619fc3358b68535c0c02c4e52bc
     environment:
       RABBITMQ_ERLANG_COOKIE: "devcontainer-cookie"
     healthcheck:
@@ -48,5 +49,6 @@ services:
       retries: 10
 
 volumes:
-  postgres-data:
+  venv:
+  aiida-config:
   aiida-repository:

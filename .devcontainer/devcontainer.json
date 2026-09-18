@@ -1,16 +1,23 @@
 {
   "name": "aiida-feff dev",
+  // Podman users: append "docker-compose.podman.yml" to this list. It carries
+  // `userns_mode: keep-id`, which Docker Engine rejects, so it cannot live in
+  // the base file without breaking every Docker user. See that file and
+  // README.md ("Development environment").
   "dockerComposeFile": "docker-compose.yml",
   "service": "app",
   "workspaceFolder": "/workspace",
-
   "features": {
     "ghcr.io/devcontainers/features/common-utils:2": {
       "installZsh": true,
       "configureZshAsDefaultShell": true
     }
   },
-
+  "containerEnv": {
+    // Bind mounts do not support hardlinks; set here rather than only inside
+    // post-create.sh so interactive `uv` calls do not warn either.
+    "UV_LINK_MODE": "copy"
+  },
   "customizations": {
     "vscode": {
       "extensions": [
@@ -26,12 +33,12 @@
       }
     }
   },
-
   "postCreateCommand": "bash .devcontainer/post-create.sh",
-
+  // The daemon does not survive a container stop/start. Without this,
+  // submitted processes sit in 'created' forever with no obvious cause.
+  "postStartCommand": "uv run verdi daemon start 2 || true",
   "remoteUser": "vscode",
   "updateRemoteUserUID": false,
-
   "forwardPorts": [8888],
   "portsAttributes": {
     "8888": { "label": "Jupyter" }

@@ -1,125 +1,84 @@
 #!/usr/bin/env bash
-# post-create.sh — run once after the devcontainer is created
+# post-create.sh — run once after the devcontainer is created.
+#
+# Idempotent: every step checks before acting, so re-running is safe and a
+# rebuild never destroys stored data. An earlier version dropped the Postgres
+# schema and emptied the repository directory whenever ~/.aiida/config.json
+# was missing -- which was exactly the state a rebuild produced, because the
+# config was not on a named volume while the data volumes were. That reset
+# step is gone along with Postgres itself.
 set -euo pipefail
 
 cd /workspace
 
-# ── 0. Configure Git and Workspace Permissions ──────────────────────────────
-# Configure git to trust the workspace and ignore file mode changes.
-# This prevents Podman Desktop on MacOS from showing thousands of mode changes
-# (100644 => 100755) due to virtualization mount differences.
+# ── 0. Git configuration ────────────────────────────────────────────────────
+# Trust the workspace and ignore file-mode changes: rootless Podman on macOS
+# otherwise reports thousands of spurious 100644 => 100755 diffs.
 git config --global --add safe.directory /workspace
 git config --global core.filemode false
 git config core.filemode false || true
 
-# Fix workspace ownership ONLY if the workspace is not currently writable.
-# Frequently, Podman Desktop on MacOS automatically maps the host user, and
-# running chown recursively modifies host file metadata/permissions unnecessarily.
-if [ ! -w /workspace ]; then
-  echo "Workspace of /workspace is not writable. Attempting to fix ownership..."
-  sudo chown "$(id -u):$(id -g)" /workspace
-  if [ -d /workspace/.git ]; then
-    sudo find /workspace -mindepth 1 -path /workspace/.git -prune -o -exec chown "$(id -u):$(id -g)" {} +
-  else
-    sudo chown -R "$(id -u):$(id -g)" /workspace
-  fi
-fi
+# NB: there is deliberately no chown of /workspace here. The previous version
+# chowned everything *except* .git, so in the one situation it triggered --
+# the workspace being unwritable due to a UID mismatch -- .git stayed
+# unwritable and every subsequent git operation failed. Ownership is now
+# handled by keeping the venv out of the bind mount (see docker-compose.yml)
+# and by userns_mode for Podman users (docker-compose.podman.yml).
 
-# ── 0b. Remove any stale .venv left by a different UID (e.g. host bind-mount) ─
-# uv cannot modify a venv it doesn't own; safer to recreate it.
-if [ -d /workspace/.venv ]; then
-  VENV_OWNER="$(stat -c '%u' /workspace/.venv)"
-  if [ "$VENV_OWNER" != "$(id -u)" ]; then
-    sudo rm -rf /workspace/.venv
-  fi
-fi
-
-# ── 0c. Add x86_64 glibc for QEMU-emulated FEFF binaries (ARM64 hosts) ──────
-# larch ships only x86_64 FEFF binaries. On aarch64 they run via
-# qemu-x86_64-static, which is present in the base image, but requires
-# the x86_64 dynamic linker and glibc to be installed as a foreign arch.
+# ── 0b. x86_64 glibc for QEMU-emulated FEFF binaries on ARM64 hosts ─────────
+# larch ships only x86_64 FEFF binaries. On aarch64 they run through
+# qemu-x86_64-static. Note that the emulation is provided by the container
+# runtime's binfmt_misc registration on the host, not by this image, so it can
+# be absent even when the packages below are installed; step 5 verifies that
+# the binary actually executes rather than assuming it.
 if [ "$(uname -m)" = "aarch64" ] && ! dpkg -l libc6:amd64 &>/dev/null; then
   sudo dpkg --add-architecture amd64
   sudo apt-get update -qq
   sudo apt-get install -y --no-install-recommends libc6:amd64
 fi
 
-# ── 1. Install uv ────────────────────────────────────────────────────────────
-if ! command -v uv &>/dev/null; then
-  curl -Lsf https://astral.sh/uv/install.sh | sh
+# ── 1. Install uv (version-pinned) ──────────────────────────────────────────
+# Pinned rather than `curl https://astral.sh/uv/install.sh | sh`, so that two
+# developers building the same commit months apart get the same uv, and so the
+# toolchain is not whatever the vendor is serving at container-creation time.
+UV_VERSION="0.11.21"
+if ! command -v uv &>/dev/null || [ "$(uv --version | awk '{print $2}')" != "$UV_VERSION" ]; then
+  curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
   export PATH="$HOME/.local/bin:$PATH"
 fi
 
-# Avoid hardlink warnings on container/bind-mount filesystems.
-export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
+# ── 2. Install the package and the extras CI uses ───────────────────────────
+# --extra plots: without it tests/test_visualise.py silently *skips* here via
+#   importorskip while running in CI -- green locally, red on push.
+# --extra pre-commit: AGENTS.md makes a clean local `pre-commit` the contract
+#   for a clean CI lint job, so the tool has to exist in the container.
+# --locked: fail rather than silently re-resolving and rewriting uv.lock.
+uv sync --locked --extra testing --extra plots --extra pre-commit
 
-# ── 2. Install the package and all optional deps ─────────────────────────────
-uv sync --extra testing
+# Install the git hooks so the contract above is actually enforced locally.
+uv run pre-commit install
 
-# Refresh command hash so newly installed console scripts (e.g. verdi)
-# are resolvable in this shell session.
+# Refresh the command hash so newly installed console scripts resolve.
 hash -r 2>/dev/null || true
 
-# ── 2b. Prepare persistent AiiDA repository volume ──────────────────────────
-mkdir -p /tmp/aiida-feff-repository
-sudo chown -R "$(id -u):$(id -g)" /tmp/aiida-feff-repository
-
-# ── 3. Set up the AiiDA profile ──────────────────────────────────────────────
+# ── 3. Set up the AiiDA profile ─────────────────────────────────────────────
+# core.sqlite_dos, matching the test suite. With --use-rabbitmq the daemon
+# still works, so examples/example_ensemble.py (which calls submit) runs.
 if uv run verdi profile show default &>/dev/null; then
   uv run verdi profile set-default default
 else
-  # A failed first-time setup can leave the development database partially
-  # initialised even though no profile was written to config. Reset the local
-  # dev state before retrying profile creation.
-  if uv run python - <<'PY'
-import json
-from pathlib import Path
-
-config_path = Path('/home/vscode/.aiida/config.json')
-if not config_path.exists():
-    raise SystemExit(1)
-
-data = json.loads(config_path.read_text())
-raise SystemExit(0 if not data.get('profiles') else 1)
-PY
-  then
-    rm -rf /tmp/aiida-feff-repository/*
-    uv run python - <<'PY'
-import os
-import psycopg
-
-conn = psycopg.connect(
-    host=os.environ.get('AIIDA_DB_HOST', 'localhost'),
-    port=int(os.environ.get('AIIDA_DB_PORT', '5432')),
-    dbname=os.environ.get('AIIDA_DB_NAME', 'aiida'),
-    user=os.environ.get('AIIDA_DB_USER', 'aiida'),
-    password=os.environ.get('AIIDA_DB_PASS', 'aiida'),
-    autocommit=True,
-)
-with conn, conn.cursor() as cur:
-    cur.execute('DROP SCHEMA IF EXISTS public CASCADE')
-    cur.execute('CREATE SCHEMA public')
-PY
-  fi
-
-  uv run verdi profile setup core.psql_dos \
+  uv run verdi profile setup core.sqlite_dos \
     --profile-name default \
     --non-interactive \
     --set-as-default \
-    --database-hostname "${AIIDA_DB_HOST:-localhost}" \
-    --database-port "${AIIDA_DB_PORT:-5432}" \
-    --database-name "${AIIDA_DB_NAME:-aiida}" \
-    --database-username "${AIIDA_DB_USER:-aiida}" \
-    --database-password "${AIIDA_DB_PASS:-aiida}" \
     --use-rabbitmq \
     --email "dev@local" \
     --first-name Dev \
     --last-name User \
-    --institution Local \
-    --repository-uri "file:///tmp/aiida-feff-repository"
+    --institution Local
 fi
 
-# ── 4. Set up a localhost computer for running calculations ──────────────────
+# ── 4. Localhost computer for running calculations ──────────────────────────
 if ! uv run verdi computer show localhost &>/dev/null; then
   uv run verdi computer setup \
     --label localhost \
@@ -133,26 +92,46 @@ if ! uv run verdi computer show localhost &>/dev/null; then
 fi
 
 # ── 5. Locate the FEFF8L binary that xraylarch ships ────────────────────────
-FEFF_EXE=$(uv run python -c "
-import sys, os
-sp = next(p for p in sys.path if 'site-packages' in p)
-print(os.path.join(sp, 'larch', 'bin', 'linux64', 'feff8l.sh'))
+# Ask larch where it lives rather than guessing at a site-packages entry: the
+# previous version took the first sys.path entry containing "site-packages",
+# which need not be the one holding larch.
+FEFF_SRC=$(uv run python -c "
+import pathlib, sys
+import larch
+platform_dir = {'linux': 'linux64', 'darwin': 'darwin64', 'win32': 'win64'}[sys.platform]
+print(pathlib.Path(larch.__file__).parent / 'bin' / platform_dir / 'feff8l.sh')
 ")
 
-if [ ! -f "$FEFF_EXE" ]; then
+if [ ! -f "$FEFF_SRC" ]; then
   echo "ERROR: could not find feff8l.sh inside the xraylarch package." >&2
   echo "       Make sure 'uv sync' succeeded." >&2
   exit 1
 fi
 
-# Fix shebang: feff8l.sh uses ${BASH_SOURCE[0]} but ships with #!/bin/sh
-sed -i 's|^#!/bin/sh|#!/bin/bash|' "$FEFF_EXE"
+# feff8l.sh ships with #!/bin/sh but uses ${BASH_SOURCE[0]}, which is a bash
+# builtin. Rather than patching the file inside .venv -- which any later
+# `uv sync` silently reverts, leaving an obscure runtime failure -- register a
+# wrapper this repository owns.
+FEFF_EXE=/usr/local/bin/feff8l-wrapper
+sudo tee "$FEFF_EXE" >/dev/null <<WRAPPER
+#!/bin/bash
+# Runs the xraylarch-bundled FEFF8L under bash. Generated by post-create.sh.
+exec bash "$FEFF_SRC" "\$@"
+WRAPPER
+sudo chmod +x "$FEFF_EXE"
+chmod +x "$(dirname "$FEFF_SRC")"/feff8l* || true
 
-# Make every binary in that directory executable.
-# Must run AFTER sed -i because sed -i rewrites the file and can strip the +x bit.
-chmod +x "$(dirname "$FEFF_EXE")"/feff8l*
+# Verify FEFF actually runs. On ARM64 this depends on the host runtime having
+# registered qemu-x86_64 binfmt handlers, which the image cannot guarantee, so
+# fail here with a clear message rather than inside a queued calculation.
+if ! "$(dirname "$FEFF_SRC")/feff8l_rdinp" --version &>/dev/null \
+   && ! "$(dirname "$FEFF_SRC")/feff8l_rdinp" &>/dev/null; then
+  echo "WARNING: the bundled FEFF8L binaries did not execute." >&2
+  echo "         On Apple Silicon / ARM64 this usually means the container" >&2
+  echo "         runtime has not registered x86_64 emulation." >&2
+fi
 
-# ── 6. Register feff8l as the 'feff' code in AiiDA ───────────────────────────
+# ── 6. Register feff8l as the 'feff' code in AiiDA ──────────────────────────
 if ! uv run verdi code show feff@localhost &>/dev/null 2>&1; then
   uv run verdi code create core.code.installed \
     --non-interactive \
@@ -162,7 +141,7 @@ if ! uv run verdi code show feff@localhost &>/dev/null 2>&1; then
     --description "FEFF8L from xraylarch"
 fi
 
-# ── 7. Register venv python3 for path aggregation ───────────────────────────
+# ── 7. Register the venv python3 for path aggregation ───────────────────────
 PYTHON3_EXE="/workspace/.venv/bin/python3"
 if [ ! -x "$PYTHON3_EXE" ]; then
   echo "ERROR: expected venv python at $PYTHON3_EXE" >&2
@@ -178,13 +157,18 @@ if ! uv run verdi code show python3@localhost &>/dev/null 2>&1; then
     --description "Python 3 (venv) for FEFF path aggregation"
 fi
 
-# ── 8. Start the AiiDA daemon ────────────────────────────────────────────────
+# ── 8. Start the AiiDA daemon ───────────────────────────────────────────────
+# Also started by postStartCommand in devcontainer.json, because the daemon
+# does not survive a container stop/start and submitted processes would
+# otherwise sit in 'created' with no obvious cause.
 uv run verdi daemon start 2
 
 echo ""
 echo "✓ aiida-feff devcontainer ready."
-echo "  FEFF binary : $FEFF_EXE"
+echo "  Storage     : core.sqlite_dos (no PostgreSQL needed)"
+echo "  FEFF binary : $FEFF_EXE -> $FEFF_SRC"
 echo "  Python code : $PYTHON3_EXE (python3@localhost)"
-echo "  Run tests   : uv run pytest tests/ -v"
+echo "  Run tests   : uv run pytest tests/"
+echo "  Lint as CI  : uv run pre-commit run --all-files"
 echo "  verdi shell : uv run verdi shell"
 echo "  Daemon      : uv run verdi daemon status"

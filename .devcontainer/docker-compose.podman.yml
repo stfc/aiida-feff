@@ -1,0 +1,16 @@
+# Podman-only overrides.
+#
+# `userns_mode: keep-id` maps the host UID into the container so files in the
+# bind-mounted workspace stay writable under rootless Podman. Docker Engine
+# rejects any userns value other than "host" or empty, so the base compose
+# file cannot carry it -- with it in place the devcontainer fails to start for
+# every Docker user, which is what README.md sends people to.
+#
+# To use: set the "dockerComposeFile" entry in devcontainer.json to
+#
+#   "dockerComposeFile": ["docker-compose.yml", "docker-compose.podman.yml"]
+#
+# or run `docker compose -f docker-compose.yml -f docker-compose.podman.yml up`.
+services:
+  app:
+    userns_mode: keep-id

@@ -29,7 +29,11 @@ dependencies = [
     "ase>=3.22",
     "xraylarch>=0.9.80",
     "h5py>=3.0",
-    "md-exafs>=0.2.0",
+    # Capped: aiida-feff re-exports md-exafs' physics functions directly, so a
+    # minor release there changes this package's numerical output. The cap
+    # forces the bump to be a deliberate PR that runs the larch oracle tests
+    # before users see it.
+    "md-exafs>=0.2.0,<0.3",
 ]
 
 [project.optional-dependencies]

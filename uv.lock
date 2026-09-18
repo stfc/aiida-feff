@@ -67,6 +67,7 @@ dependencies = [
     { name = "aiida-core" },
     { name = "ase" },
     { name = "h5py" },
+    { name = "md-exafs" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -109,6 +110,7 @@ requires-dist = [
     { name = "coveralls", marker = "extra == 'testing'" },
     { name = "h5py", specifier = ">=3.0" },
     { name = "matplotlib", marker = "extra == 'plots'", specifier = ">=3.6" },
+    { name = "md-exafs", specifier = ">=0.2.0,<0.3" },
     { name = "mypy", marker = "extra == 'pre-commit'", specifier = ">=1.10" },
     { name = "numpy", specifier = ">=1.21" },
     { name = "pre-commit", marker = "extra == 'pre-commit'", specifier = ">=3.0" },
@@ -2631,6 +2633,27 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/bd/c0/9f7c9a46090390368a4d7bcb76bb87a4a36c421e4c0792cdb53486ffac7a/matplotlib_inline-0.2.2.tar.gz", hash = "sha256:72f3fe8fce36b70d4a5b612f899090cd0401deddc4ea90e1572b9f4bfb058c79", size = 8150, upload-time = "2026-05-08T17:33:33.49Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/41/09/5b161152e2d90f7b87f781c2e1267494aef9c32498df793f73ad0a0a494a/matplotlib_inline-0.2.2-py3-none-any.whl", hash = "sha256:3c821cf1c209f59fb2d2d64abbf5b23b67bcb2210d663f9918dd851c6da1fcf6", size = 9534, upload-time = "2026-05-08T17:33:32.055Z" },
+]
+
+[[package]]
+name = "md-exafs"
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "ase" },
+    { name = "h5py" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pymatgen" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "xraylarch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f8/36/028811aee020752fb39633a190daced6f05605469f3603f99e1bb6a92dc9/md_exafs-0.2.0.tar.gz", hash = "sha256:0f872fe36e22d5d82941b8c513a02297f26336d9ec4dcf35140032af4282ed6b", size = 156085, upload-time = "2026-09-18T10:08:26.349Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c9/2a/2773ae1cdf8b042fab266fb64a63b31eafceaa1f629eefd6e02f6e726ae3/md_exafs-0.2.0-py3-none-any.whl", hash = "sha256:8c56e23b02346f5c7753a8971477906959788694709159ec3144b2ba791652ce", size = 169336, upload-time = "2026-09-18T10:08:24.707Z" },
 ]
 
 [[package]]

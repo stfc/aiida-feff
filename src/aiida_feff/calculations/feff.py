@@ -327,6 +327,11 @@ class FeffCalculation(CalcJob):
 
         # --- exit codes -------------------------------------------------------
         spec.exit_code(310, "ERROR_MISSING_XMUDA", message="FEFF did not produce xmu.dat.")
+        spec.exit_code(
+            311,
+            "ERROR_POTENTIALS_INCOMPLETE",
+            message="Potentials-only run produced no FEFF output; it did not start.",
+        )
         spec.exit_code(400, "ERROR_PARSING_FAILED", message="Parser raised an exception: {reason}.")
 
         # Validate combinations up front: prepare_for_submission cannot report

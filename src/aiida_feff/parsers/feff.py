@@ -75,6 +75,21 @@ class FeffParser(Parser):
             if self._is_potentials_only():
                 # CONTROL switched the spectrum modules off; pot.pad / phase.pad
                 # in the remote folder are the deliverable, and that is success.
+                #
+                # But a run that crashed before FEFF started also produces no
+                # xmu.dat, and would otherwise be indistinguishable from
+                # success -- collect_potentials would then hand an empty
+                # remote folder to every snapshot in the ensemble, and the
+                # whole run would quietly use no potentials at all. The
+                # potential files themselves stay on the remote and are not
+                # retrieved, so they cannot be checked here; FEFF's banner on
+                # stdout is the available evidence that it ran at all.
+                if feff_version is None:
+                    self.logger.error(
+                        "Potentials-only run produced no FEFF banner in "
+                        f"{FEFF_LOG_FILE}: FEFF did not start."
+                    )
+                    return self.exit_codes.ERROR_POTENTIALS_INCOMPLETE  # type: ignore[no-any-return]
                 self.logger.info("Potentials-only run: no xmu.dat expected.")
                 return ExitCode(0)
             return self.exit_codes.ERROR_MISSING_XMUDA  # type: ignore[no-any-return]

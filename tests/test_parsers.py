@@ -3,8 +3,11 @@
 import io
 import textwrap
 
+import numpy as np
 import pytest
 from aiida.orm import FolderData
+
+from aiida_feff.calculations.feff import FeffCalculation
 
 # ---------------------------------------------------------------------------
 # Sample output files
@@ -35,6 +38,33 @@ SAMPLE_CHI = textwrap.dedent("""\
       2.000     0.08912   0.08912   0.34560
       3.000     0.12345   0.12345   0.56780
     """)
+
+
+def _dense_xmuda() -> str:
+    """A spectrum dense enough for larch's autobk spline to converge.
+
+    SAMPLE_XMUDA has 8 data points, which is too few, so it exercises only
+    the chi.dat fallback. Both branches need to be reachable for the
+    chi_source attribute to be testable at all.
+    """
+    energy = np.arange(6900.0, 7800.0, 1.0)
+    k = np.sqrt(np.clip(energy - 7112.0, 0.0, None) * 0.2624684)
+    mu = np.where(energy < 7112.0, 0.1, 1.0 + 0.05 * np.sin(2 * k * 2.5) * np.exp(-0.03 * k * k))
+    mu0 = np.where(energy < 7112.0, 0.1, 1.0)
+    rows = [
+        f"{energy[i] - 7112.0:12.4f} {energy[i]:12.4f} {k[i]:10.4f} "
+        f"{mu[i]:12.6f} {mu0[i]:12.6f} {0.0:12.6f}"
+        for i in range(len(energy))
+    ]
+    header = [
+        "# Feff8L (EXAFS)  0.1",
+        "# e0 = 7112.00",
+        "#   omega      e        k        mu       mu0      chi",
+    ]
+    return "\n".join(header + rows) + "\n"
+
+
+DENSE_XMUDA = _dense_xmuda()
 
 
 @pytest.fixture()
@@ -102,7 +132,7 @@ class TestFeffParserIntegration:
             entry_point_name="feff.feff",
             retrieved={},
         )
-        assert result.exit_status == 310
+        assert result.exit_status == FeffCalculation.exit_codes.ERROR_MISSING_XMUDA.status
 
 
 class TestPotentialsOnlyRuns:
@@ -135,7 +165,24 @@ class TestPotentialsOnlyRuns:
             retrieved={"log.dat": "Feff8L (EXAFS)  0.1\n"},
             inputs={"parameters": self._parameters(CONTROL_NO_POT)},
         )
-        assert result.exit_status == 310
+        assert result.exit_status == FeffCalculation.exit_codes.ERROR_MISSING_XMUDA.status
+
+    def test_a_potentials_run_that_never_started_is_not_success(self, parse_retrieved):
+        """An empty log means FEFF never ran, whatever CONTROL asked for.
+
+        Without this the parser cannot tell a crashed potentials run from a
+        successful one -- both simply lack xmu.dat -- and the workchain would
+        hand an empty remote folder to every snapshot in the ensemble.
+        """
+        from aiida_feff.calculations.feff import CONTROL_POT_ONLY
+
+        result = parse_retrieved(
+            entry_point_name="feff.feff",
+            retrieved={"log.dat": ""},
+            inputs={"parameters": self._parameters(CONTROL_POT_ONLY)},
+        )
+        assert result.exit_status == FeffCalculation.exit_codes.ERROR_POTENTIALS_INCOMPLETE.status
+        assert "xas_data" not in result.outputs
 
 
 class TestIsPotentialsOnly:
@@ -182,16 +229,37 @@ class TestParsedMetadata:
         assert xas.base.attributes.get("feff_version") == "Feff8.50L"
         assert "xraylarch" in xas.base.attributes.get("code_versions")
 
-    def test_chi_source_distinguishes_autobk_from_feff(self, parse_retrieved):
-        """larch's spline background and FEFF's mu0 are different definitions."""
+    def test_chi_source_records_autobk_when_the_spline_succeeds(self, parse_retrieved):
+        """larch's spline background and FEFF's mu0 are different definitions.
+
+        The three branches are asserted separately and by exact value. The
+        previous version accepted ``in {"larch.autobk", "feff.chi.dat"}``,
+        i.e. either answer to the question it was posing, so it could not
+        detect the parser silently switching background algorithm -- which
+        changes what chi(k) means.
+        """
+        result = parse_retrieved(entry_point_name="feff.feff", retrieved={"xmu.dat": DENSE_XMUDA})
+        xas = result.outputs.xas_data
+        assert xas.base.attributes.get("chi_source") == "larch.autobk"
+        assert "chi_k" in xas.get_arraynames()
+
+    def test_chi_source_falls_back_to_feffs_own_chi(self, parse_retrieved):
+        """Too few points for a spline, but chi.dat is there to use instead."""
         result = parse_retrieved(
             entry_point_name="feff.feff",
             retrieved={"xmu.dat": SAMPLE_XMUDA, "chi.dat": SAMPLE_CHI},
         )
-        assert result.outputs.xas_data.base.attributes.get("chi_source") in {
-            "larch.autobk",
-            "feff.chi.dat",
-        }
+        xas = result.outputs.xas_data
+        assert xas.base.attributes.get("chi_source") == "feff.chi.dat"
+        # ...and the values really are FEFF's, not a spline's.
+        assert xas.get_array("chi_k")[2] == pytest.approx(0.08912, rel=1e-4)
+
+    def test_chi_source_is_none_when_neither_route_works(self, parse_retrieved):
+        """No usable chi(k) must be recorded as such, not left to look valid."""
+        result = parse_retrieved(entry_point_name="feff.feff", retrieved={"xmu.dat": SAMPLE_XMUDA})
+        xas = result.outputs.xas_data
+        assert xas.base.attributes.get("chi_source") == "none"
+        assert "chi_k" not in xas.get_arraynames()
 
 
 class TestExcerptTraceback:

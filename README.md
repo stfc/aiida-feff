@@ -101,9 +101,25 @@ print(f"chi(k) shape: {xas.chi_k.shape}")
 
 ### 3. Ensemble EXAFS from an MD trajectory (localhost / dev)
 
-> **Recommended Environment:** Running these examples requires AiiDA services (PostgreSQL, RabbitMQ, daemon) and FEFF. The absolute easiest way to run them is to open this project in a **VS Code DevContainer** (`.devcontainer/`). The container fully configures AiiDA, downloads the FEFF8L binary, sets up both the `feff@localhost` and `python3@localhost` codes, and starts the daemon automatically on creation.
+> **Recommended environment:** these examples need a RabbitMQ broker and a
+> running AiiDA daemon (for `submit`), plus FEFF. The easiest route is the
+> **VS Code DevContainer** in `.devcontainer/`, which sets up the AiiDA profile,
+> registers the `feff@localhost` and `python3@localhost` codes, and starts the
+> daemon. FEFF8L is *not* downloaded: it ships inside the `xraylarch`
+> dependency and the container simply points a code at it.
 >
-> *If running outside the DevContainer, you must manually run `verdi` services, have a working FEFF executable, and register a Python executable as an installed code (`verdi code create core.code.installed ...`) named e.g. `python3@localhost` pointing to your virtual environment's Python interpreter.*
+> The container uses the `core.sqlite_dos` storage backend, so **no PostgreSQL
+> is required** — the same backend the test suite uses.
+>
+> **Podman users:** set `dockerComposeFile` in `.devcontainer/devcontainer.json`
+> to `["docker-compose.yml", "docker-compose.podman.yml"]`. The override adds
+> `userns_mode: keep-id`, which Docker Engine rejects and which therefore
+> cannot live in the base file.
+>
+> *Outside the container you need a broker and daemon running, a working FEFF
+> executable, and a Python interpreter registered as an installed code
+> (`verdi code create core.code.installed ...`, e.g. `python3@localhost`) for
+> path aggregation.*
 
 Pass a real `TrajectoryData` node, or use the synthetic-trajectory helper
 included in `examples/` to run a quick end-to-end test without any MD data:
@@ -369,56 +385,44 @@ plt.show()
 
 ### 7. Debye-Waller σ² from an MD trajectory (optional)
 
-Compute per-path MSRD (σ²) directly from a `TrajectoryData` node — no
-separate DW code needed.
+Per-path MSRD (σ²) is computed directly from the trajectory by
+[md-exafs](https://pypi.org/project/md-exafs/), which this plugin depends on.
 
-Two variants are provided:
-
-- `compute_msrd` / `compute_adp` — plain Python functions, return plain dicts/arrays.  **Not recorded in the database.**  Use these when exploring cutoffs and tolerances interactively.
-- `store_msrd` / `store_adp` — `@calcfunction` wrappers.  Accept and return AiiDA nodes; every call is recorded in the provenance graph.  Use these in workflows.
+**This step is deliberately not provenance-tracked.** σ² is cheap to recompute
+and the trajectory it derives from is already a stored node, so recording the
+result would add graph weight without adding recoverable information. The
+`store_msrd` / `store_adp` calcfunction wrappers that earlier versions shipped
+have been removed for that reason; call md-exafs directly.
 
 ```python
-from aiida_feff.calcfunctions.debye_waller import compute_msrd, store_msrd
-from aiida.orm import Dict
+from md_exafs.debye_waller import calculate_grouped_msrd
 
-params = {
-    "absorber_site": "Fe",   # element, "Fe.1" (first Fe), or "3" (1-based index)
-    "cutoff": 3.5,           # neighbour search radius in Å
-    "cutoff_3body": 3.0,     # include 3-body paths (omit to skip)
-    "skip_frames": 50,       # discard first N frames (equilibration)
-}
+from aiida_feff.utils import trajectory_to_structures
+
+structures = [s.get_ase() for s in trajectory_to_structures(traj_node)]
 
 # `cutoff` must stay below the inscribed-sphere radius of the cell, or the
 # minimum-image convention picks the wrong neighbour and biases σ² low.
-# compute_msrd raises rather than returning a quietly wrong number; build a
-# supercell, or pass allow_unsafe_cutoff=True if you accept the bias.
-# There is no `align` key: MSRD is computed from raw coordinates, because
-# Kabsch alignment rotates the frame away from the cell used for the MIC.
+# Build a supercell rather than raising the cutoff.
+two_body, three_body = calculate_grouped_msrd(
+    structures,
+    central_indices=[0],     # zero-based absorber indices
+    central_label="Fe",
+    cutoff=3.5,              # neighbour search radius in Å
+    cutoff_3body=3.0,        # include 3-body paths (omit to skip)
+)
 
-# Interactive exploration — no DB writes:
-result = compute_msrd(traj_node, params)
-for key, val in sorted(result.items(), key=lambda x: x[1]["reff"]):
-    print(f"{key}: reff={val['reff']:.3f} Å  σ²={val['sigma2']:.5f} Å²")
-
-# Store in provenance graph when happy with the parameters:
-msrd_node = store_msrd(trajectory=traj_node, params=Dict(params))
-# Fe-Fe_2p48_2body: reff=2.481 Å  σ²=0.00612 Å²
-# Fe-Fe_4p05_2body: reff=4.052 Å  σ²=0.00891 Å²
+for group in sorted(two_body, key=lambda g: g["reff"]):
+    print(f"{group['scatterer']}: reff={group['reff']:.3f} Å  σ²={group['sigma2']:.5f} Å²")
+# Fe: reff=2.481 Å  σ²=0.00612 Å²
+# Fe: reff=4.052 Å  σ²=0.00891 Å²
 ```
 
-Per-atom B-factors and full U tensors:
+The resulting σ² values can be passed straight to
+`aiida_feff.calcfunctions.exafs.total_chi` as a `scatterer -> σ²` mapping.
 
-```python
-from aiida_feff.calcfunctions.debye_waller import compute_adp, store_adp
-
-adp = compute_adp(traj_node, {"skip_frames": 50})
-print(adp["b_factors"])    # ndarray, shape (n_atoms,)
-print(adp["u_tensor"])     # ndarray, shape (n_atoms, 3, 3)
-
-# Or with provenance:
-adp_node = store_adp(trajectory=traj_node, params=Dict({"skip_frames": 50}))
-print(adp_node.get_array("b_factors"))
-```
+Per-atom B-factors and full U tensors come from the same module via
+`md_exafs.debye_waller.compute_adp_results`.
 
 ## CLI
 
@@ -479,10 +483,13 @@ without requiring any extra code to be installed on the HPC.
 ## Development
 
 ```bash
-git clone https://github.com/youruser/aiida-feff
+git clone https://github.com/stfc/aiida-feff
 cd aiida-feff
-pip install -e .[testing]
-pytest tests/ -v
+uv sync --locked --extra testing --extra plots
+uv run pytest tests/
+
+# Lint exactly as CI does
+uv run pre-commit run --all-files
 ```
 
 ## Relationship to [larch-cli](https://github.com/stfc/alc-dls-exafs/)

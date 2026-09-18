@@ -56,15 +56,13 @@ a generated `feff.inp` across a pymatgen change is still worth doing.
   from scipy rather than hard-coded. No Bohr/Rydberg conversion exists anywhere.
 - Disorder is reported as **σ² (variance, Å²)**, never σ, and every second
   moment in the package uses the sample estimator (`ddof=1`).
-- Multiple-scattering `reff` is half the total path length, per FEFF.
-- The 3-body angle in `debye_waller.py` is the **included angle at the first
-  scatterer**, i.e. 180° − FEFF's scattering angle. The scatterer–scatterer leg
-  is the difference of the two absorber-relative MIC vectors, so the triangle
-  closes; minimum-imaging it separately picks images that form no triangle.
+- Multiple-scattering `reff` is half the total path length, per FEFF. The
+  larch oracle in `test_exafs.py` covers one MS path (`feff0007.dat`,
+  `nlegs=3`) for exactly this reason; keep an MS path in `ORACLE_DATS`.
 - `XasData.energy` holds FEFF's `omega` column, energy **relative to E0**;
   `XasData.absolute_energy` adds `e0` back.
-- Fourier-transform defaults, including `window="kaiser"`, live in
-  `calcfunctions.larch.FT_DEFAULTS`. `xftf_arrays` is the only call site of
+- Fourier-transform defaults, including `window="kaiser"`, are re-exported
+  as `calcfunctions.larch.FT_DEFAULTS` from `md_exafs.spectra`. `xftf_arrays` is the only call site of
   larch's `xftf`; route new transforms through it rather than adding a fourth.
 - χ(R) carries units Å^-(kweight+1), so `kweight` is recorded in the output
   node's `fourier_params` attribute and any axis label must read it back.
@@ -91,17 +89,16 @@ a generated `feff.inp` across a pymatgen change is still worth doing.
 
 ## Minimum-image safety
 
-`_max_safe_mic_cutoff` returns the inscribed-sphere radius of the cell. A
-neighbour cutoff above it biases distances downward and MSRD by tens of percent,
-so `compute_msrd` **raises** rather than returning a quietly wrong number;
-`allow_unsafe_cutoff=True` downgrades it to a warning. Any distance-based test
-needs a cell large enough for its cutoff — use `conftest.bcc_supercell_positions`
-or the `generate_trajectory` fixture's `reps` argument, not a bigger cutoff.
+A neighbour cutoff above the cell's inscribed-sphere radius biases distances
+downward and MSRD by tens of percent. The check now lives in md-exafs. Any
+distance-based test needs a cell large enough for its cutoff — use
+`conftest.bcc_supercell_positions` or the `generate_trajectory` fixture's
+`reps` argument, not a bigger cutoff.
 
 ## Silently-ignored keys are errors here
 
-`FeffParameters`, `compute_msrd` and `compute_adp` all reject keys they do not
-read, and `resolve_ft_params` rejects unknown FT keys. A key that is accepted
+`FeffParameters` rejects keys it does not read, and `resolve_ft_params`
+(re-exported from md-exafs) rejects unknown FT keys. A key that is accepted
 and ignored produces a default run while the caller believes otherwise, and it
 still changes the input node's hash. Add new keys to the corresponding
 `VALID_KEYS` / `*_PARAM_KEYS` set in the same change that starts reading them.
@@ -126,9 +123,33 @@ The last one is the pattern to reach for: where an independent implementation of
 the same physics exists, test against it rather than against a restatement of
 your own formula. A test that imports the constant it checks proves nothing.
 
-`tests/test_ensemble_run.py` runs the whole workchain outline in-process against
-a shell script standing in for FEFF, which is how the batch path, potential
-reuse and failure handling get covered without a cluster.
+### The physics now lives in md-exafs
+
+`src/` re-exports `path_chi`, `xftf_arrays`, `resolve_ft_params` and
+`scaled_chi_arrays` from md-exafs as the *same objects*. A test that imports
+one symbol from each package and compares them therefore compares a function
+to itself and cannot fail — `tests/test_numerical_parity.py` did exactly that
+and was deleted. Test the delta this plugin adds (provenance, node
+attributes, AiiDA plumbing, negative-index rejection), and keep the larch
+oracle as an integration guard against an md-exafs regression. `md-exafs` is
+capped at `<0.3` so a physics-affecting bump has to be a deliberate PR here.
+
+### The FEFF stand-in must read its input
+
+`tests/test_ensemble_run.py` runs the whole workchain outline in-process
+against a shell script standing in for FEFF. That script parses `feff.inp`
+and derives its spectrum from the nearest-neighbour distance, so each
+snapshot has a known, distinct, correct answer. An earlier constant version
+made every frame and site identical, which silently reduced
+`test_batch_and_serial_paths_agree` and the ensemble-average tests to
+comparing copies of one array — they could not detect a dropped snapshot, a
+duplicated task, or a wrong frame/site assignment. If you touch the stand-in,
+keep it input-dependent, and keep the guard assertions that fail when the
+snapshots turn out identical.
+
+Workchain children run **concurrently** under `run_get_node`. Do not key test
+behaviour on invocation order via a shared counter file; key it on the input,
+as `feff_rejecting_short_bonds` does.
 
 Golden fixtures live in `tests/fixtures/aggregate_paths/` — real Feff8L output
 from an SrTiO₃ Ti K-edge run. Their provenance and the reason they are
@@ -137,3 +158,23 @@ irreplaceable are in the README beside them.
 `examples/` is neither executed nor type-checked by CI, so physics belongs in
 `src/`, where it is tested, and examples should call it. The EXAFS equation now
 lives in `calcfunctions/exafs.py`; the synthetic example imports it.
+
+## Debye-Waller is deliberately not provenance-tracked
+
+σ² and ADPs are computed by calling md-exafs directly, not through a
+`@calcfunction`. They are cheap to recompute and the trajectory they derive
+from is already a stored node, so storing them adds graph weight without
+adding recoverable information. The `store_msrd` / `store_adp` wrappers were
+removed for this reason — do not reintroduce them as a "fix" for the missing
+provenance link.
+
+## The devcontainer is part of the build
+
+`.devcontainer/` is exercised by a CI job that builds it and runs the suite
+inside. It went unchanged from the second commit of the project while the
+package moved underneath it, which is how it accumulated a destructive
+database reset, a Podman-only compose key and a venv shared with the host.
+Storage there is `core.sqlite_dos`, matching the tests; RabbitMQ is present
+only because `examples/example_ensemble.py` calls `submit`. Images are
+digest-pinned and `uv` is version-pinned, so changes to either are visible in
+a diff.

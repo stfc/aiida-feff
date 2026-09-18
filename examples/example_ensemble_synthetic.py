@@ -264,20 +264,31 @@ def main(
     click.echo(f"  χ(R) node pk={chir_node.pk}  r-grid: {chir_node.get_array('r').shape}")
 
     # ── 5. Debye-Waller σ² from the MD trajectory ────────────────────────────
-    click.echo("Computing Debye-Waller σ² from trajectory …")
-    from aiida_feff.calcfunctions.debye_waller import store_msrd
+    #
+    # Deliberately NOT provenance-tracked. σ² is cheap to recompute from the
+    # trajectory, which is itself stored, so putting it in the graph adds node
+    # weight without adding recoverable information. The calcfunction wrappers
+    # that used to live in aiida_feff.calcfunctions.debye_waller were removed
+    # for this reason; the physics lives in md-exafs and is called directly.
+    click.echo("Computing Debye-Waller σ² from trajectory (not stored) …")
+    from md_exafs.debye_waller import calculate_grouped_msrd
 
-    # cutoff must stay inside the cell's inscribed sphere or the minimum-image
-    # convention aliases neighbours and biases sigma^2 low; compute_msrd raises
-    # rather than returning a quietly wrong number.
-    dw_params = orm.Dict({"absorber_site": "Fe.1", "cutoff": 2.7})
-    msrd_node = store_msrd(trajectory=traj, params=dw_params)
-    click.echo(f"  store_msrd pk={msrd_node.pk}")
-    click.echo("  Path σ² (Å²):")
-    for key, val in sorted(msrd_node.get_dict().items(), key=lambda x: x[1]["reff"]):
+    # The cutoff must stay inside the cell's inscribed sphere, or the
+    # minimum-image convention aliases neighbours and biases σ² low.
+    from aiida_feff.utils import trajectory_to_structures
+
+    structures = [s.get_ase() for s in trajectory_to_structures(traj)]
+    two_body, three_body = calculate_grouped_msrd(
+        structures,
+        central_indices=[0],
+        central_label="Fe",
+        cutoff=2.7,
+    )
+    click.echo(f"  {len(two_body)} two-body and {len(three_body)} three-body path groups")
+    for group in sorted(two_body, key=lambda g: g["reff"])[:5]:
         click.echo(
-            f"    {key:30s}  reff={val['reff']:.3f} Å"
-            f"  σ²={val['sigma2']:.5f} Å²  n_paths={val['count']}"
+            f"    {group['scatterer']:>4s}  reff={group['reff']:.3f} Å"
+            f"  σ²={group['sigma2']:.5f} Å²  n={group['count']}"
         )
 
     # ── 6. Collect individual snapshot XasData for overlay ──────────────────
@@ -439,7 +450,7 @@ def main(
     click.echo(f"  EnsembleWorkChain    pk={wc_node.pk}")
     click.echo(f"  averaged_xas         pk={averaged_xas.pk}")
     click.echo(f"  chi_k_to_r output    pk={chir_node.pk}")
-    click.echo(f"  store_msrd output    pk={msrd_node.pk}")
+    click.echo("  Debye-Waller sigma^2 : computed, not stored (see step 5)")
     if path_contrib is not None:
         click.echo(f"  path_contributions   pk={path_contrib.pk}")
 

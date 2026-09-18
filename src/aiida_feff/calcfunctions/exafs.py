@@ -72,8 +72,8 @@ def total_chi(
         k_out: Output wavenumber grid, Å⁻¹.
         sigma2: Either one σ² applied to every path, or a mapping from
             ``scatterer`` to σ² (Å²) — e.g. the output of
-            :func:`~aiida_feff.calcfunctions.debye_waller.compute_msrd`
-            re-keyed by path type.
+            :func:`md_exafs.debye_waller.calculate_grouped_msrd` re-keyed by
+            path type.
         s02: Amplitude reduction factor.
         e0_shift: ΔE₀ in eV.
         frame_idx: Restrict to one MD frame (merged nodes only).

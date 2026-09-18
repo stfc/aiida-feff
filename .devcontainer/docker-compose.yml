@@ -19,12 +19,13 @@ services:
     image: mcr.microsoft.com/devcontainers/python@sha256:a00123df1ec4af04b4013fda8c27438b73b1817a24f6bcd3d61e2f6aa0800302
     volumes:
       - ..:/workspace:cached
-      # The virtualenv lives in a named volume rather than inside the bind
-      # mount. Sharing .venv with the host means the container may inherit an
-      # interpreter built for the host's OS and Python version (this repo is
-      # developed on macOS, and the image is Linux), and it also means opening
-      # the container mutates the host's working environment.
-      - venv:/workspace/.venv
+      # Only AiiDA state is persisted. The virtualenv is NOT a volume: see
+      # UV_PROJECT_ENVIRONMENT below.
+      #
+      # Both of these mount at paths that do not exist in the image, so the
+      # runtime creates them owned by root rather than by vscode. post-create.sh
+      # chowns them before first use; do not add a volume here without adding
+      # it there too, or the first write fails with EACCES.
       - aiida-config:/home/vscode/.aiida
       - aiida-repository:/home/vscode/.aiida/repository
     environment:
@@ -32,6 +33,20 @@ services:
       AIIDA_BROKER_PORT: "5672"
       AIIDA_BROKER_USER: guest
       AIIDA_BROKER_PASS: guest
+      # Keep the virtualenv out of the bind-mounted workspace. Sharing .venv
+      # with the host makes the container inherit an interpreter built for the
+      # host's OS and Python version (this repo is developed on macOS, the
+      # image is Linux), and makes opening the container mutate the host's
+      # working environment.
+      #
+      # A named volume at /workspace/.venv would also work, but the runtime
+      # creates it root-owned and uv then fails on CACHEDIR.TAG with EACCES.
+      # /home/vscode already exists in the image owned by vscode, so a plain
+      # directory there needs no ownership fixing. It is rebuilt by uv sync on
+      # each container create, which is cheap.
+      UV_PROJECT_ENVIRONMENT: /home/vscode/.venv
+      # Bind mounts do not support hardlinks.
+      UV_LINK_MODE: copy
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -49,6 +64,5 @@ services:
       retries: 10
 
 volumes:
-  venv:
   aiida-config:
   aiida-repository:

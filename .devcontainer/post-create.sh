@@ -25,6 +25,19 @@ git config core.filemode false || true
 # handled by keeping the venv out of the bind mount (see docker-compose.yml)
 # and by userns_mode for Podman users (docker-compose.podman.yml).
 
+# ── 0a. Take ownership of the named volumes ─────────────────────────────────
+# A named volume whose mount point does not already exist in the image is
+# created owned by root, so the vscode user cannot write to it. /home/vscode
+# exists but /home/vscode/.aiida does not, so both AiiDA volumes land
+# root-owned and the first `verdi profile setup` fails with EACCES.
+#
+# Empty-directory chown only; this never touches existing data.
+for volume_path in /home/vscode/.aiida /home/vscode/.aiida/repository; do
+  if [ ! -w "$volume_path" ]; then
+    sudo chown "$(id -u):$(id -g)" "$volume_path"
+  fi
+done
+
 # ── 0b. x86_64 glibc for QEMU-emulated FEFF binaries on ARM64 hosts ─────────
 # larch ships only x86_64 FEFF binaries. On aarch64 they run through
 # qemu-x86_64-static. Note that the emulation is provided by the container
@@ -142,7 +155,8 @@ if ! uv run verdi code show feff@localhost &>/dev/null 2>&1; then
 fi
 
 # ── 7. Register the venv python3 for path aggregation ───────────────────────
-PYTHON3_EXE="/workspace/.venv/bin/python3"
+# Matches UV_PROJECT_ENVIRONMENT in docker-compose.yml.
+PYTHON3_EXE="${UV_PROJECT_ENVIRONMENT:-/home/vscode/.venv}/bin/python3"
 if [ ! -x "$PYTHON3_EXE" ]; then
   echo "ERROR: expected venv python at $PYTHON3_EXE" >&2
   exit 1

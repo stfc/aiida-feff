@@ -31,6 +31,14 @@
       }
     }
   },
+  // GitHub Codespaces sizing. The default 2-core/8GB machine works; this
+  // states the floor so a 2GB machine is refused up front rather than dying
+  // partway through `uv sync`.
+  "hostRequirements": {
+    "cpus": 2,
+    "memory": "8gb",
+    "storage": "32gb"
+  },
   "postCreateCommand": "bash .devcontainer/post-create.sh",
   // The daemon does not survive a container stop/start. Without this,
   // submitted processes sit in 'created' forever with no obvious cause.

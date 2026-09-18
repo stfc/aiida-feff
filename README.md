@@ -101,18 +101,26 @@ print(f"chi(k) shape: {xas.chi_k.shape}")
 
 ### 3. Ensemble EXAFS from an MD trajectory (localhost / dev)
 
-> **Recommended environment:** these examples need a RabbitMQ broker and a
-> running AiiDA daemon (for `submit`), plus FEFF. The easiest route is the
-> **VS Code DevContainer** in `.devcontainer/`, which sets up the AiiDA profile,
-> registers the `feff@localhost` and `python3@localhost` codes, and starts the
-> daemon. FEFF8L is *not* downloaded: it ships inside the `xraylarch`
-> dependency and the container simply points a code at it.
+> **Recommended environment:** the DevContainer in `.devcontainer/` gives you
+> a full IDE against a *real* AiiDA profile: SQLite storage, a RabbitMQ broker,
+> a running daemon, and both `feff@localhost` and `python3@localhost`
+> registered. Calculations you run there produce real nodes and a real
+> provenance graph, so `verdi` works as it would anywhere else.
 >
-> The container uses the `core.sqlite_dos` storage backend, so **no PostgreSQL
-> is required** — the same backend the test suite uses.
+> It runs on the host's own architecture, so it is equally at home in
+> **GitHub Codespaces** (Code → Codespaces → Create) and on a local Docker or
+> Podman. Verified end to end on Apple Silicon: `post-create.sh` completes,
+> FEFF8L runs, and the full test suite passes inside the container.
 >
-> **Podman users:** set `dockerComposeFile` in `.devcontainer/devcontainer.json`
-> to `["docker-compose.yml", "docker-compose.podman.yml"]`. The override adds
+> FEFF8L is not downloaded; it ships inside the `xraylarch` dependency and the
+> container points a code at it. On arm64 those x86_64 binaries run through
+> the runtime's qemu handler, for which post-create installs the x86_64
+> loader. No PostgreSQL is involved: storage is `core.sqlite_dos`, the same
+> backend the tests use.
+>
+> **Podman users:** set `dockerComposeFile` in
+> `.devcontainer/devcontainer.json` to
+> `["docker-compose.yml", "docker-compose.podman.yml"]`. The override adds
 > `userns_mode: keep-id`, which Docker Engine rejects and which therefore
 > cannot live in the base file.
 >

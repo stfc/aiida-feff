@@ -15,7 +15,27 @@
 services:
 
   app:
-    # mcr.microsoft.com/devcontainers/python:3.12
+    # No `platform:` pin: the container runs on the host's own architecture.
+    #
+    # x86_64 (GitHub Codespaces, CI, Intel Mac, Linux) is the straightforward
+    # case. On arm64 (Apple Silicon) two things need help, both handled
+    # elsewhere rather than by emulating the whole container:
+    #
+    #   * larch ships FEFF8L only as x86_64 binaries. They run under the
+    #     qemu-x86_64 binfmt handler the container runtime registers on the
+    #     host, once the x86_64 loader is present; post-create.sh installs
+    #     libc6:amd64 for that.
+    #   * pyFAI (via xraylarch) stopped publishing aarch64 wheels after
+    #     2025.1.0, so a newer one would be built from 94 Cython sources and
+    #     run out of memory. constraint-dependencies in pyproject.toml holds
+    #     aarch64 at the last version with wheels.
+    #
+    # Pinning the service to linux/amd64 instead was tried and is worse: uv
+    # segfaults under qemu ("uncaught target signal 11"), even with
+    # concurrency forced to 1.
+    #
+    # mcr.microsoft.com/devcontainers/python:3.12 (multi-arch index digest,
+    # so this resolves on both architectures)
     image: mcr.microsoft.com/devcontainers/python@sha256:a00123df1ec4af04b4013fda8c27438b73b1817a24f6bcd3d61e2f6aa0800302
     volumes:
       - ..:/workspace:cached
@@ -57,6 +77,11 @@ services:
     image: rabbitmq@sha256:d7af1c87c5f1eda13fcfca06db452bf3aeab6619fc3358b68535c0c02c4e52bc
     environment:
       RABBITMQ_ERLANG_COOKIE: "devcontainer-cookie"
+    volumes:
+      # Raises consumer_timeout. Without it aiida-core reports this broker as
+      # unsupported and long workchain steps are killed mid-flight. See the
+      # file for why the timeout is raised rather than the broker downgraded.
+      - ./rabbitmq.conf:/etc/rabbitmq/conf.d/20-aiida.conf:ro
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 5s

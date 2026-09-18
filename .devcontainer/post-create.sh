@@ -38,13 +38,19 @@ for volume_path in /home/vscode/.aiida /home/vscode/.aiida/repository; do
   fi
 done
 
-# ── 0b. x86_64 glibc for QEMU-emulated FEFF binaries on ARM64 hosts ─────────
-# larch ships only x86_64 FEFF binaries. On aarch64 they run through
-# qemu-x86_64-static. Note that the emulation is provided by the container
-# runtime's binfmt_misc registration on the host, not by this image, so it can
-# be absent even when the packages below are installed; step 5 verifies that
-# the binary actually executes rather than assuming it.
+# ── 0b. x86_64 loader for the FEFF binaries on arm64 hosts ──────────────────
+# larch ships FEFF8L only as x86_64. On Apple Silicon these run through the
+# qemu-x86_64 binfmt handler that the container runtime registers on the host.
+# That handler is registered with the F ("fix binary") flag, so it is *not*
+# visible as an entry in the container's own /proc/sys/fs/binfmt_misc -- do
+# not conclude from an empty listing there that emulation is unavailable.
+#
+# What the container does have to supply is the x86_64 dynamic loader and
+# glibc. Without them the handler fires and then fails with
+#   qemu-x86_64-static: Could not open '/lib64/ld-linux-x86-64.so.2'
+# which reads like a missing binary rather than a missing dependency.
 if [ "$(uname -m)" = "aarch64" ] && ! dpkg -l libc6:amd64 &>/dev/null; then
+  echo "arm64 host: installing the x86_64 loader so FEFF8L can run …"
   sudo dpkg --add-architecture amd64
   sudo apt-get update -qq
   sudo apt-get install -y --no-install-recommends libc6:amd64
@@ -134,14 +140,12 @@ WRAPPER
 sudo chmod +x "$FEFF_EXE"
 chmod +x "$(dirname "$FEFF_SRC")"/feff8l* || true
 
-# Verify FEFF actually runs. On ARM64 this depends on the host runtime having
-# registered qemu-x86_64 binfmt handlers, which the image cannot guarantee, so
-# fail here with a clear message rather than inside a queued calculation.
-if ! "$(dirname "$FEFF_SRC")/feff8l_rdinp" --version &>/dev/null \
-   && ! "$(dirname "$FEFF_SRC")/feff8l_rdinp" &>/dev/null; then
+# Verify FEFF actually executes, rather than discovering it does not inside a
+# queued calculation. With the amd64 pin this should always succeed; if it
+# does not, the binaries or their glibc dependencies are the problem.
+if ! "$(dirname "$FEFF_SRC")/feff8l_rdinp" &>/dev/null; then
   echo "WARNING: the bundled FEFF8L binaries did not execute." >&2
-  echo "         On Apple Silicon / ARM64 this usually means the container" >&2
-  echo "         runtime has not registered x86_64 emulation." >&2
+  echo "         Check 'ldd $(dirname "$FEFF_SRC")/feff8l_rdinp'." >&2
 fi
 
 # ── 6. Register feff8l as the 'feff' code in AiiDA ──────────────────────────
@@ -170,6 +174,14 @@ if ! uv run verdi code show python3@localhost &>/dev/null 2>&1; then
     --filepath-executable "$PYTHON3_EXE" \
     --description "Python 3 (venv) for FEFF path aggregation"
 fi
+
+# ── 7b. Silence the RabbitMQ version warning ────────────────────────────────
+# aiida-core warns about any broker >= 3.8.15 because of the 30-minute default
+# consumer timeout. rabbitmq.conf raises that timeout to ~115 days, so the
+# condition the warning describes does not apply here. Suppressed only
+# because it has actually been addressed; if that mount is ever removed, this
+# line has to go with it.
+uv run verdi config set warnings.rabbitmq_version False >/dev/null
 
 # ── 8. Start the AiiDA daemon ───────────────────────────────────────────────
 # Also started by postStartCommand in devcontainer.json, because the daemon

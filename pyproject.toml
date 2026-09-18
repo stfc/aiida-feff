@@ -172,6 +172,18 @@ exclude = [
 ]
 show_error_codes = true
 
+[tool.uv]
+# pyFAI arrives through xraylarch and stopped publishing linux aarch64 wheels
+# after 2025.1.0. Without this bound, an arm64 machine (Apple Silicon, arm64
+# CI) builds its 94 Cython extension modules from source, which is slow and
+# exhausts the memory of a default container VM.
+#
+# Marker-gated, so x86_64 keeps tracking the current release. This is a
+# [tool.uv] constraint rather than a project dependency: it shapes resolution
+# here without appearing in the published package metadata, and it is
+# recorded in uv.lock so CI's --locked sync enforces it.
+constraint-dependencies = ["pyfai<2025.2 ; platform_machine == 'aarch64'"]
+
 [dependency-groups]
 dev = [
     "mypy>=1.19.1",

@@ -10,6 +10,7 @@ interpreter** and ``feff_code`` is FEFF.
 
 from __future__ import annotations
 
+import copy
 import json
 import subprocess
 import sys
@@ -20,11 +21,13 @@ import pytest
 from aiida import orm
 
 from aiida_feff.calculations.feff_batch import (
+    _RUN_TIMEOUT_FRACTION,
     BATCH_CONFIG,
     BATCH_DRIVER,
     _snap_label,
     workers_from_resources,
 )
+from tests.helpers import origin_atoms
 
 
 class TestWorkersFromResources:
@@ -233,6 +236,29 @@ class TestBatchPrepareForSubmission:
         }
         assert texts[_snap_label(0, 0)] != texts[_snap_label(1, 1)]
 
+    def test_same_frame_different_site_gives_a_different_absorber(
+        self, generate_calc_job, fixture_sandbox, batch_inputs
+    ):
+        """Two sites in the *same* frame must produce different inputs.
+
+        The test above compares (frame 0, site 0) against (frame 1, site 1),
+        which differ in the frame as well, so it passes even if site_indices
+        were ignored entirely. Holding the frame fixed isolates the site.
+        """
+        inputs = copy.deepcopy(batch_inputs)
+        inputs["frame_indices"] = orm.List([0, 0])
+        inputs["site_indices"] = orm.List([0, 1])
+        self._prepare(generate_calc_job, fixture_sandbox, inputs)
+
+        first = Path(fixture_sandbox.get_abs_path(f"{_snap_label(0, 0)}/feff.inp")).read_text()
+        second = Path(fixture_sandbox.get_abs_path(f"{_snap_label(0, 1)}/feff.inp")).read_text()
+        assert first != second
+
+        # Both must put *their own* absorber at the origin, which is the
+        # actual contract -- not merely that the two files differ somehow.
+        for text in (first, second):
+            assert len(origin_atoms(text)) == 1, "expected exactly one atom at the origin"
+
     def test_config_records_the_feff_environment(
         self, generate_calc_job, fixture_sandbox, batch_inputs
     ):
@@ -254,7 +280,27 @@ class TestBatchPrepareForSubmission:
     ):
         self._prepare(generate_calc_job, fixture_sandbox, batch_inputs)
         config = json.loads(Path(fixture_sandbox.get_abs_path(BATCH_CONFIG)).read_text())
-        assert 0 < config["run_timeout_seconds"] < 3600
+        # Pin the actual value. `0 < x < 3600` held for any fraction in (0, 1)
+        # and so pinned nothing -- including a fraction of 0.999 that would
+        # leave no time to retrieve the chunk's results after a hung run.
+        wallclock = batch_inputs["metadata"]["options"]["max_wallclock_seconds"]
+        assert config["run_timeout_seconds"] == pytest.approx(wallclock * _RUN_TIMEOUT_FRACTION)
+        # The margin has to be big enough to actually retrieve results in.
+        assert wallclock - config["run_timeout_seconds"] >= 60
+
+    def test_run_timeout_is_absent_when_the_wallclock_is(
+        self, generate_calc_job, fixture_sandbox, batch_inputs
+    ):
+        """No wallclock means no per-run timeout -- a hung FEFF blocks the chunk.
+
+        This branch silently disables the timeout on a cluster, so it needs
+        to be a deliberate, visible behaviour rather than an untested one.
+        """
+        batch_inputs = copy.deepcopy(batch_inputs)
+        del batch_inputs["metadata"]["options"]["max_wallclock_seconds"]
+        self._prepare(generate_calc_job, fixture_sandbox, batch_inputs)
+        config = json.loads(Path(fixture_sandbox.get_abs_path(BATCH_CONFIG)).read_text())
+        assert config["run_timeout_seconds"] is None
 
     def test_driver_script_is_shipped(self, generate_calc_job, fixture_sandbox, batch_inputs):
         self._prepare(generate_calc_job, fixture_sandbox, batch_inputs)
@@ -370,3 +416,48 @@ class TestBatchParser:
         assert status == 0
         node = outputs["xas_data"][_snap_label(0, 0)]
         assert node.base.attributes.get("feff_version") == "Feff8.50L"
+
+
+class TestSnapDirNameParsing:
+    """Snapshot directory names carry the (frame, site) identity of a run.
+
+    A name that fails to parse must yield (None, None) so the caller can skip
+    it, rather than silently mapping the run onto frame 0 / site 0 and
+    corrupting the ensemble.
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("snap_0000_site_0000", (0, 0)),
+            ("snap_0003_site_0012", (3, 12)),
+            ("snap_1234_site_5678", (1234, 5678)),
+        ],
+    )
+    def test_well_formed_names(self, name, expected):
+        from aiida_feff.parsers.feff_batch import _parse_snap_dir_name
+
+        assert _parse_snap_dir_name(name) == expected
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "snap_0000",  # no site part
+            "snap_abcd_site_0000",  # non-numeric frame
+            "snap_0000_site_xyz",  # non-numeric site
+            "not_a_snapshot",
+            "",
+            "snap__site_",
+        ],
+    )
+    def test_malformed_names_return_none_rather_than_guessing(self, name):
+        from aiida_feff.parsers.feff_batch import _parse_snap_dir_name
+
+        assert _parse_snap_dir_name(name) == (None, None)
+
+    def test_round_trips_with_the_label_writer(self):
+        """The parser must invert the same function the calcjob writes with."""
+        from aiida_feff.parsers.feff_batch import _parse_snap_dir_name
+
+        for frame, site in ((0, 0), (7, 3), (42, 11)):
+            assert _parse_snap_dir_name(_snap_label(frame, site)) == (frame, site)

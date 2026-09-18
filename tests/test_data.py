@@ -20,8 +20,29 @@ class TestFeffParameters:
             FeffParameters(dict={"edge": "Z99"}).validate()
 
     def test_missing_edge(self):
-        with pytest.raises(Exception):
+        # Bare `pytest.raises(Exception)` would also pass on an ImportError,
+        # AttributeError or TypeError -- i.e. on the validator being broken
+        # rather than on it rejecting the input.
+        with pytest.raises(ValueError, match="edge"):
             FeffParameters(dict={"s02": 0.9}).validate()
+
+    @pytest.mark.parametrize(
+        ("params", "match"),
+        [
+            ({"edge": "K", "spectrum_type": "XANES"}, "spectrum_type"),
+            ({"edge": "K", "radius": 0.0}, "radius"),
+            ({"edge": "K", "radius": -1.0}, "radius"),
+            ({"edge": "K", "s02": -0.1}, "s02"),
+        ],
+    )
+    def test_out_of_range_values_are_rejected(self, params, match):
+        """These raises existed but nothing reached them.
+
+        An unvalidated radius of 0 produces a FEFF run with an empty cluster,
+        which fails hours later on the cluster rather than at submission.
+        """
+        with pytest.raises(ValueError, match=match):
+            FeffParameters(dict=params).validate()
 
     def test_edge_property(self, generate_feff_parameters):
         p = generate_feff_parameters(edge="L2")
@@ -44,13 +65,50 @@ class TestFeffParameters:
 
 
 class TestXasData:
-    def test_set_and_get_spectrum(self, generate_xas_data):
+    def test_set_and_get_spectrum(self):
+        """Round-trip actual values, not just shapes taken from a fixture.
+
+        Shape assertions against a fixture that chose the shape pass for any
+        implementation that stores an array of the right length -- including
+        one that stores the wrong array.
+        """
+        import numpy as np
+
+        from aiida_feff.data.xasdata import XasData
+
+        energy = np.linspace(-20.0, 200.0, 11)
+        mu = np.arange(11.0)
+        mu0 = np.full(11, 0.5)
+
+        xas = XasData()
+        xas.set_spectrum(energy, mu, mu0, e0=7112.0)
+
+        np.testing.assert_allclose(xas.energy, energy)
+        np.testing.assert_allclose(xas.mu, mu)
+        # NB: mu0 has no accessor property, unlike mu/k/chi_k.
+        np.testing.assert_allclose(xas.get_array("mu0"), mu0)
+        # energy is stored relative to E0; absolute_energy adds it back.
+        np.testing.assert_allclose(xas.absolute_energy, energy + 7112.0)
+
+    def test_set_and_get_chi(self):
+        import numpy as np
+
+        from aiida_feff.data.xasdata import XasData
+
+        k = np.linspace(0.0, 15.0, 7)
+        chi = np.sin(k)
+
+        xas = XasData()
+        xas.set_chi(k, chi)
+
+        np.testing.assert_allclose(xas.k, k)
+        np.testing.assert_allclose(xas.chi_k, chi)
+
+    def test_fixture_shapes(self, generate_xas_data):
+        """The shared fixture keeps the shapes other tests rely on."""
         xas = generate_xas_data()
         assert xas.energy.shape == (200,)
         assert xas.mu.shape == (200,)
-
-    def test_set_and_get_chi(self, generate_xas_data):
-        xas = generate_xas_data()
         assert xas.chi_k.shape == (300,)
         assert xas.k.shape == (300,)
 

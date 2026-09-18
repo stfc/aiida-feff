@@ -124,3 +124,65 @@ class TestScaleSimulatedSpectrum:
         node.set_spectrum(np.linspace(0, 10, 5), np.ones(5))
         with pytest.raises(ValueError, match="no .* arrays to scale"):
             scale_simulated_spectrum(node.store(), Dict({}))
+
+
+class TestImportExperimentalSpectrumCalcfunction:
+    """The public ``@calcfunction`` entry point, as users actually call it.
+
+    Only the private ``_impl`` was tested before, so the provenance wrapper --
+    which is the reason this lives in an AiiDA plugin rather than in a script
+    -- was never exercised.
+    """
+
+    @staticmethod
+    def _source(tmp_path, aiida_profile):
+        from aiida.orm import SinglefileData
+
+        path = tmp_path / "experimental_chi.dat"
+        path.write_text("# k chi\n0.5 0.1\n1.0 0.2\n2.0 -0.3\n")
+        return SinglefileData(str(path)).store()
+
+    def test_imports_and_records_its_source(self, tmp_path, aiida_profile):
+        from aiida.orm import Dict
+
+        from aiida_feff.calcfunctions.experimental import import_experimental_spectrum
+
+        source = self._source(tmp_path, aiida_profile)
+        out = import_experimental_spectrum(source, Dict({"labels": ["k", "chi"], "autobk": False}))
+
+        np.testing.assert_allclose(out.get_array("k"), [0.5, 1.0, 2.0])
+        np.testing.assert_allclose(out.get_array("chi_k"), [0.1, 0.2, -0.3])
+        assert out.base.attributes.get("source_file") == "experimental_chi.dat"
+        assert out.base.attributes.get("source_kind") == "experimental"
+
+    def test_the_upload_stays_in_the_provenance_graph(self, tmp_path, aiida_profile):
+        """The imported node must be traceable back to the file it came from."""
+        from aiida.orm import Dict
+
+        from aiida_feff.calcfunctions.experimental import import_experimental_spectrum
+
+        source = self._source(tmp_path, aiida_profile)
+        out = import_experimental_spectrum(source, Dict({"labels": ["k", "chi"], "autobk": False}))
+
+        creator = out.creator
+        assert creator is not None
+        incoming = creator.base.links.get_incoming().all_nodes()
+        assert source.uuid in {node.uuid for node in incoming}
+
+    def test_versions_are_recorded_as_attributes(self, tmp_path, aiida_profile):
+        """Library versions shape the numbers, so they belong in attributes.
+
+        Extras stay mutable after storage and are excluded from the node
+        hash, so caching would treat differently-produced nodes as identical.
+        """
+        from aiida.orm import Dict
+
+        from aiida_feff.calcfunctions.experimental import import_experimental_spectrum
+        from aiida_feff.versions import VERSIONS_ATTR
+
+        source = self._source(tmp_path, aiida_profile)
+        out = import_experimental_spectrum(source, Dict({"labels": ["k", "chi"], "autobk": False}))
+
+        versions = out.base.attributes.get(VERSIONS_ATTR)
+        assert "xraylarch" in versions
+        assert VERSIONS_ATTR not in out.base.extras.all

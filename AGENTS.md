@@ -155,9 +155,21 @@ Golden fixtures live in `tests/fixtures/aggregate_paths/` — real Feff8L output
 from an SrTiO₃ Ti K-edge run. Their provenance and the reason they are
 irreplaceable are in the README beside them.
 
-`examples/` is neither executed nor type-checked by CI, so physics belongs in
-`src/`, where it is tested, and examples should call it. The EXAFS equation now
-lives in `calcfunctions/exafs.py`; the synthetic example imports it.
+`examples/` is not type-checked, but it *is* executed: the devcontainer CI job
+runs `.devcontainer/smoke-examples.sh`, which drives every example against
+real `feff@localhost` / `python3@localhost` codes and asserts on their output,
+not merely their exit status. Three broken examples reached main before that
+existed (an import of the deleted `calcfunctions.debye_waller`, a call to the
+removed `store_msrd`, and a `title` key `FeffParameters` rejects), so an
+example that no longer matches the API is now a failing check.
+
+Physics still belongs in `src/`, where it is unit-tested, and examples should
+call it. Plotting counts as physics here: χ(R) carries units Å^-(kweight+1),
+so an example that reimplements the transform gets the axis units wrong
+silently. `visualise.plot_chi_k` and `plot_chi_r` take `ax=` and forward
+`**plot_kwargs` to `ax.plot` precisely so a caller can overlay several curves
+without re-deriving any of it. Wrap raw arrays in an unstored `XasData` and
+pass that, rather than dropping down to matplotlib.
 
 ## Debye-Waller is deliberately not provenance-tracked
 

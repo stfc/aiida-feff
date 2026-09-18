@@ -57,4 +57,10 @@ jobs:
         with:
           configFile: .devcontainer/devcontainer.json
           push: never
-          runCmd: uv run pytest tests -q
+          # Both halves matter. The suite proves the environment works; the
+          # smoke script proves examples/ still matches the API, which nothing
+          # else checks -- three broken examples reached main before this
+          # existed.
+          runCmd: |
+            uv run pytest tests -q
+            bash .devcontainer/smoke-examples.sh

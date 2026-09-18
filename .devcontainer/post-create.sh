@@ -56,6 +56,19 @@ if [ "$(uname -m)" = "aarch64" ] && ! dpkg -l libc6:amd64 &>/dev/null; then
   sudo apt-get install -y --no-install-recommends libc6:amd64
 fi
 
+# ── 0c. Memory check ────────────────────────────────────────────────────────
+# RabbitMQ, the daemon workers and a running workchain together need more than
+# a default 2 GB VM provides. The failure mode without this warning is a bare
+# SIGKILL (exit 137) partway through an example, with nothing explaining it.
+TOTAL_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+if [ "$TOTAL_MB" -lt 4096 ]; then
+  echo "WARNING: this container has ${TOTAL_MB} MB of RAM." >&2
+  echo "         Tests are fine, but the ensemble examples need ~4 GB and" >&2
+  echo "         will be killed (exit 137) without it." >&2
+  echo "         Podman: podman machine stop && podman machine set --memory 8192" >&2
+  echo "         Docker Desktop: Settings > Resources > Memory" >&2
+fi
+
 # ── 1. Install uv (version-pinned) ──────────────────────────────────────────
 # Pinned rather than `curl https://astral.sh/uv/install.sh | sh`, so that two
 # developers building the same commit months apart get the same uv, and so the

@@ -129,6 +129,29 @@ print(f"chi(k) shape: {xas.chi_k.shape}")
 > (`verdi code create core.code.installed ...`, e.g. `python3@localhost`) for
 > path aggregation.*
 
+The synthetic example covers the whole pipeline and doubles as the smoke test
+CI runs:
+
+```bash
+# Serial: one scheduler job per snapshot, with per-path contributions stored
+uv run python examples/example_ensemble_synthetic.py \
+    --code feff@localhost --python-code python3@localhost \
+    --n-snapshots 6 --store-paths --plot-file ensemble.png
+
+# Batch: one scheduler job per chunk, the mode intended for HPC. Produces a
+# consolidated ExafsArchiveData instead of per-snapshot shards.
+uv run python examples/example_ensemble_synthetic.py \
+    --code feff@localhost --python-code python3@localhost \
+    --n-snapshots 12 --batch-size 4 --plot-file ensemble.png
+
+# Reuse one set of scattering potentials across every snapshot
+uv run python examples/example_ensemble_synthetic.py \
+    --code feff@localhost --n-snapshots 6 --precompute-potentials
+```
+
+The ensemble runs need roughly 4 GB of RAM; below that the daemon is killed
+mid-run and the only symptom is exit 137.
+
 Pass a real `TrajectoryData` node, or use the synthetic-trajectory helper
 included in `examples/` to run a quick end-to-end test without any MD data:
 

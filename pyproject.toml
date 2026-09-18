@@ -128,7 +128,9 @@ max-statements = 100
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["D", "N806", "PLC0415", "B017", "E501", "PLR2004"]
-"examples/**/*.py" = ["D", "N806", "PLC0415", "E501", "PLR2004"]
+# Click commands accumulate one parameter per CLI option; that is the
+# shape of the library, not a design problem in the example.
+"examples/**/*.py" = ["D", "N806", "PLC0415", "E501", "PLR2004", "PLR0913"]
 "src/aiida_feff/calculations/_aggregate_paths.py" = ["SIM105"]
 "src/aiida_feff/data/pathcontributions.py" = ["SIM108"]
 

@@ -101,6 +101,7 @@ def plot_chi_k(
     ax=None,
     label: str | None = None,
     plot_envelope: bool = False,
+    **plot_kwargs,
 ) -> Figure:
     """Plot k-weighted χ(k).
 
@@ -116,6 +117,11 @@ def plot_chi_k(
         Legend label.
     plot_envelope:
         If the node contains ``chi_k_std`` (ensemble average), shade ±1σ.
+    **plot_kwargs:
+        Forwarded to ``ax.plot`` (``color``, ``linestyle``, ``lw``, ``zorder``
+        …). Lets callers overlay several curves on one axis without
+        reimplementing the k-weighting and the axis labels, which is how the
+        examples used to end up with a second, untested copy of this code.
 
     Returns:
     -------
@@ -132,12 +138,14 @@ def plot_chi_k(
         fig, ax = plt.subplots()
 
     _label = label or (xas_data.label or f"pk={xas_data.pk}")
-    ax.plot(k, kw_chi, label=_label)
+    ax.plot(k, kw_chi, label=_label, **plot_kwargs)
 
     if plot_envelope and "chi_k_std" in xas_data.get_arraynames():
         std = xas_data.get_array("chi_k_std")
         kw_std = k**kweight * std
-        ax.fill_between(k, kw_chi - kw_std, kw_chi + kw_std, alpha=0.25)
+        # Match the line colour when the caller specified one.
+        shade = {"color": plot_kwargs["color"]} if "color" in plot_kwargs else {}
+        ax.fill_between(k, kw_chi - kw_std, kw_chi + kw_std, alpha=0.25, **shade)
 
     ax.set_xlabel("k (Å⁻¹)")
     ax.set_ylabel(f"k$^{{{kweight}}}$χ(k) (Å$^{{-{kweight}}}$)")
@@ -160,6 +168,7 @@ def plot_chi_r(
     ax=None,
     label: str | None = None,
     rmax: float | None = None,
+    **plot_kwargs,
 ) -> Figure:
     """Plot χ(R) from either an FT result node or an XasData node.
 
@@ -188,6 +197,8 @@ def plot_chi_r(
         Legend label.
     rmax:
         Clip the x-axis at this R value.
+    **plot_kwargs:
+        Forwarded to ``ax.plot``; see :func:`plot_chi_k`.
 
     Returns:
     -------
@@ -222,7 +233,7 @@ def plot_chi_r(
 
     _label = label or (getattr(source, "label", None) or f"pk={source.pk}")
     mask = (r <= rmax) if rmax is not None else slice(None)
-    ax.plot(r[mask], y[mask], label=_label)
+    ax.plot(r[mask], y[mask], label=_label, **plot_kwargs)
 
     component_label = {"mag": "|χ(R)|", "re": "Re[χ(R)]", "im": "Im[χ(R)]"}[component]
     # χ(R) from a k^n-weighted transform carries units of Å^-(n+1), so the

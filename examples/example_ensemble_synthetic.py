@@ -141,6 +141,28 @@ def make_trajectory(
     help="Bin width (Å) for grouping equivalent scattering paths across frames.",
 )
 @click.option(
+    "--batch-size",
+    default=None,
+    type=int,
+    help=(
+        "Run snapshots through FeffBatchCalculation in chunks of this size, "
+        "one scheduler job per chunk, instead of one job per snapshot. "
+        "Requires --python-code. This is the mode intended for HPC, where a "
+        "job per snapshot means thousands of queue entries."
+    ),
+)
+@click.option(
+    "--precompute-potentials/--no-precompute-potentials",
+    default=False,
+    show_default=True,
+    help=(
+        "Run FEFF once per absorber site to generate the scattering "
+        "potentials, then reuse them for every snapshot. The potentials "
+        "depend on the average environment rather than the instantaneous "
+        "one, so this is a physical approximation as well as a saving."
+    ),
+)
+@click.option(
     "--plot-file", default=None, help="Save the plot to this path instead of showing interactively."
 )
 @click.option(
@@ -161,6 +183,8 @@ def main(
     python_code,
     path_cw_threshold,
     path_r_bin,
+    batch_size,
+    precompute_potentials,
     plot_file,
     group_label,
 ):
@@ -183,7 +207,6 @@ def main(
     # ── 2. Define FEFF parameters ────────────────────────────────────────────
     params = FeffParameters(
         dict={
-            "title": "Synthetic BCC Fe ensemble",
             "edge": "K",
             "spectrum_type": "EXAFS",
             "s02": 1.0,
@@ -218,6 +241,21 @@ def main(
         # plots are the groups the provenance graph recorded.
         wc_inputs["path_r_bin"] = orm.Float(path_r_bin)
 
+    if batch_size:
+        if not python_code:
+            raise click.UsageError("--batch-size requires --python-code (e.g. python3@localhost).")
+        # NB the code/feff_code inversion: FeffBatchCalculation runs a Python
+        # driver on the compute node that invokes FEFF itself, so its `code`
+        # is the interpreter and FEFF arrives as `feff_code`. The workchain
+        # performs that swap; here both are simply supplied.
+        wc_inputs.setdefault("python_code", orm.load_code(python_code))
+        wc_inputs["batch_size"] = orm.Int(batch_size)
+        click.echo(f"  batch mode: chunks of {batch_size} snapshot(s) per scheduler job")
+
+    if precompute_potentials:
+        wc_inputs["precompute_potentials"] = orm.Bool(True)
+        click.echo("  precomputing scattering potentials once per site")
+
     if group_label:
         wc_inputs["group_label"] = orm.Str(group_label)
 
@@ -246,6 +284,20 @@ def main(
         f"k-grid: {averaged_xas.get_array('k').shape}  "
         f"n_snapshots={averaged_xas.base.extras.get('n_snapshots')}"
     )
+
+    # The consolidated ensemble archive (ADR 0004). Only the batch path writes
+    # shards, so the serial route legitimately has no archive and says so
+    # rather than leaving the output silently absent.
+    archive = getattr(wc_node.outputs, "archive", None)
+    if archive is not None:
+        click.echo(
+            f"  archive pk={archive.pk}  ensemble={archive.is_ensemble}  "
+            f"k-grid: {archive.k.shape}  r-grid: {archive.r.shape}"
+        )
+        shards = [c for c in wc_node.called if c.label.startswith("batch_")]
+        click.echo(f"    merged from {len(shards)} batch shard(s)")
+    elif batch_size:
+        click.echo("  archive: MISSING despite batch mode", err=True)
 
     # Grab merged path contributions node (present when --store-paths is enabled).
     path_contrib = getattr(wc_node.outputs, "path_contributions", None)
@@ -323,10 +375,6 @@ def main(
         frame_means = [np.mean(v, axis=0) for v in per_frame.values()]
         return np.mean(frame_means, axis=0), len(per_frame)
 
-    chi_avg = averaged_xas.get_array("chi_k")
-    chir_larch = chir_node.get_array("chir_mag")
-    r_larch = chir_node.get_array("r")
-
     mask = (k_avg >= ft_kmin) & (k_avg <= ft_kmax)
     scored = []
     for key, paths in groups.items():
@@ -335,7 +383,7 @@ def main(
         k2chi = k_avg**2 * chi_path
         score = freq * np.trapezoid(np.abs(k2chi[mask]), k_avg[mask])
         representative = paths[0]
-        scored.append((score, key, representative, k2chi, freq))
+        scored.append((score, key, representative, chi_path, freq))
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[:top_paths]
 
@@ -357,82 +405,80 @@ def main(
         )
 
     # ── 8. Plot ──────────────────────────────────────────────────────────────
+    # Every curve goes through aiida_feff.visualise, which is unit-tested.
+    # This script used to build the axes by hand and call xftf_arrays itself,
+    # which made it a second, untested implementation of the k-weighting, the
+    # Fourier transform and the axis units -- the units in particular are easy
+    # to get wrong, since chi(R) carries Angstrom^-(kweight+1).
     import matplotlib
 
     if plot_file:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    from aiida_feff.data.xasdata import XasData
+    from aiida_feff.visualise import plot_chi_k, plot_chi_r
+
+    def as_xas(k, chi):
+        """Wrap raw arrays as an unstored XasData so visualise can draw them.
+
+        Unstored: these are presentation intermediates, not results, and
+        storing them would add nodes to the graph that nothing can be
+        recovered from.
+        """
+        node = XasData()
+        node.set_chi(k, chi)
+        return node
+
     colors = plt.cm.tab10.colors  # type: ignore[attr-defined]
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    fig, (ax_k, ax_r) = plt.subplots(1, 2, figsize=(13, 5))
     fig.suptitle(
         f"Ensemble EXAFS — BCC Fe  ({n_snapshots} snapshots, σ_disp={sigma} Å, "
         f"σ²_DW={sigma2_dw} Å²)",
         fontsize=12,
     )
 
-    # Panel 1: k²χ(k) — snapshots (grey) + ensemble avg (blue) + path contributions
-    ax_k = axes[0]
-    if "chi_k_std" in averaged_xas.get_arraynames():
-        std = averaged_xas.get_array("chi_k_std")
-        ax_k.fill_between(
-            k_avg,
-            k_avg**2 * (chi_avg - std),
-            k_avg**2 * (chi_avg + std),
-            alpha=0.15,
-            color="steelblue",
-        )
+    # Panel 1: k²χ(k) — snapshots, ensemble average with ±1σ, path overlays.
     for i, snap in enumerate(snapshot_xas):
-        k_s = snap.get_array("k")
-        chi_s = snap.get_array("chi_k")
-        ax_k.plot(
-            k_s,
-            k_s**2 * chi_s,
+        plot_chi_k(
+            snap,
+            kweight=2,
+            ax=ax_k,
+            label="snapshots" if i == 0 else "_nolegend_",
             color="grey",
             lw=0.5,
             alpha=0.35,
-            label="snapshots" if i == 0 else None,
         )
-    ax_k.plot(k_avg, k_avg**2 * chi_avg, color="steelblue", lw=2, label="ensemble avg", zorder=3)
-    for rank, (_score, _key, path, k2chi, freq) in enumerate(top):
+    plot_chi_k(
+        averaged_xas,
+        kweight=2,
+        ax=ax_k,
+        label="ensemble avg",
+        plot_envelope=True,
+        color="steelblue",
+        lw=2,
+        zorder=3,
+    )
+
+    # Panel 2: |χ(R)| from the provenance-tracked transform.
+    plot_chi_r(
+        chir_node, ax=ax_r, label="ensemble avg", rmax=6.0, color="steelblue", lw=2, zorder=3
+    )
+
+    # Path contributions, scaled by how often FEFF found each path. Passing
+    # freq * chi through the same helpers keeps the weighting and the units
+    # consistent with the curves above.
+    for rank, (_score, _key, path, chi_path, freq) in enumerate(top):
         nleg_str = "SS" if path.nlegs == 2 else f"MS{path.nlegs}"
         lbl = f"P{rank + 1}: {path.scatterer} r={path.r_eff:.2f}Å {nleg_str} ({freq:.0%})"
-        ax_k.plot(
-            k_avg,
-            freq * k2chi,
-            color=colors[rank % 10],
-            lw=1.3,
-            ls="--",
-            alpha=0.9,
-            label=lbl,
-            zorder=4,
-        )
-    ax_k.set_xlabel("k (Å⁻¹)")
-    ax_k.set_ylabel("k²χ(k) (Å⁻²)")
+        node = as_xas(k_avg, freq * chi_path)
+        style = {"color": colors[rank % 10], "lw": 1.3, "ls": "--", "alpha": 0.9, "zorder": 4}
+        plot_chi_k(node, kweight=2, ax=ax_k, label=lbl, **style)
+        plot_chi_r(node, ft_params=ft_dict, ax=ax_r, label=lbl, rmax=6.0, **style)
+
     ax_k.set_title("χ(k)  — dashed: freq-weighted path contributions")
     ax_k.set_xlim(k_avg[0], k_avg[-1])
     ax_k.legend(fontsize=7, loc="lower left")
-
-    # Panel 2: |χ(R)| — ensemble avg (blue) + path |χ(R)| (dashed)
-    ax_r = axes[1]
-    ax_r.plot(r_larch, chir_larch, color="steelblue", lw=2, label="ensemble avg", zorder=3)
-    for rank, (_score, _key, path, k2chi, freq) in enumerate(top):
-        nleg_str = "SS" if path.nlegs == 2 else f"MS{path.nlegs}"
-        lbl = f"P{rank + 1}: {path.scatterer} r={path.r_eff:.2f}Å {nleg_str}"
-        r_p, chir_p = _chi_to_r(k_avg, freq * k2chi)
-        mask_r = r_p <= 6.5
-        ax_r.plot(
-            r_p[mask_r],
-            chir_p[mask_r],
-            color=colors[rank % 10],
-            lw=1.3,
-            ls="--",
-            alpha=0.9,
-            label=lbl,
-            zorder=4,
-        )
-    ax_r.set_xlabel("R (Å)")
-    ax_r.set_ylabel("|χ(R)| (Å⁻³)")
     ax_r.set_title("χ(R)  — dashed: freq-weighted path contributions")
     ax_r.set_xlim(0, 6)
     ax_r.legend(fontsize=7)
@@ -453,6 +499,8 @@ def main(
     click.echo("  Debye-Waller sigma^2 : computed, not stored (see step 5)")
     if path_contrib is not None:
         click.echo(f"  path_contributions   pk={path_contrib.pk}")
+    if archive is not None:
+        click.echo(f"  archive              pk={archive.pk}")
 
 
 if __name__ == "__main__":

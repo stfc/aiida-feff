@@ -378,6 +378,21 @@ class EnsembleExafsWorkChain(WorkChain):
                 "at runtime if not set."
             ),
         )
+        spec.input(
+            "clean_scratch",
+            valid_type=orm.Bool,
+            default=lambda: orm.Bool(False),
+            help=(
+                "When using batch mode, delete successful snapshot scratch "
+                "directories on the fly."
+            ),
+        )
+        spec.input(
+            "stream_chunk_size",
+            valid_type=orm.Int,
+            required=False,
+            help="Streaming chunk size for batch mode to bound peak disk and inode usage.",
+        )
 
         spec.output_namespace(
             "averaged_xas",
@@ -677,6 +692,10 @@ class EnsembleExafsWorkChain(WorkChain):
             }
             if "n_workers" in self.inputs:
                 batch_inputs["n_workers"] = self.inputs.n_workers
+            if "clean_scratch" in self.inputs:
+                batch_inputs["clean_scratch"] = self.inputs.clean_scratch
+            if "stream_chunk_size" in self.inputs:
+                batch_inputs["stream_chunk_size"] = self.inputs.stream_chunk_size
             if use_precomputed:
                 batch_inputs["remote_potentials"] = {
                     f"site_{k:04d}": v for k, v in self.ctx.pot_remote.items()

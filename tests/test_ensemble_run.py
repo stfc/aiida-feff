@@ -597,6 +597,45 @@ class TestBatchMode:
 
         np.testing.assert_allclose(batched_chi, serial_chi, rtol=1e-10)
 
+    def test_clean_scratch_does_not_change_the_spectrum(
+        self, fake_feff_code, python_code, two_site_trajectory
+    ):
+        """clean_scratch reclaims disk only; every parsed array must be bit-identical.
+
+        Asserting n_snapshots or the node type would pass even if the averaged
+        spectrum silently changed grid, amplitude or provenance -- which is
+        exactly what happens if the parser is allowed to fall back to the
+        shard's zero-filled, mu-free chi(k). Compare the arrays instead.
+        """
+        from aiida_feff.data.parameters import FeffParameters
+
+        def average(**extra):
+            results, node = run_workchain(
+                code=fake_feff_code,
+                python_code=python_code,
+                trajectory=two_site_trajectory,
+                batch_size=orm.Int(2),
+                parameters=FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atom": 0}),
+                **extra,
+            )
+            assert node.is_finished_ok, node.exit_message
+            assert results["n_failed"].value == 0
+            return results["averaged_xas"]["all"]
+
+        clean = average(clean_scratch=orm.Bool(True), stream_chunk_size=orm.Int(1))
+        dirty = average(clean_scratch=orm.Bool(False))
+
+        # mu(E) and e0 survive stripping: the shard stores chi only, so their
+        # loss is the first symptom of the parser reading the wrong source.
+        assert set(clean.get_arraynames()) == set(dirty.get_arraynames())
+        assert {"energy", "mu", "chi_k", "k"} <= set(clean.get_arraynames())
+        assert clean.e0 == dirty.e0
+
+        for name in sorted(dirty.get_arraynames()):
+            np.testing.assert_array_equal(
+                clean.get_array(name), dirty.get_array(name), err_msg=f"array {name} differs"
+            )
+
     def test_batch_size_without_python_code_is_refused(self, fake_feff_code, two_site_trajectory):
         from aiida_feff.data.parameters import FeffParameters
 

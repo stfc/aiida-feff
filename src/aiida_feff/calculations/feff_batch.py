@@ -72,6 +72,21 @@ _SNAP_RETRIEVE = [
 ]
 _CONTRIBUTIONS_GLOB = ("snap_*/contributions_raw.h5", ".", None)
 
+
+def _scratch_keep_files(do_aggregate: bool) -> list[str]:
+    """Basenames inside a ``snap_*`` directory that must survive ``clean_scratch``.
+
+    Derived from the retrieve list rather than restated, so the set the driver
+    preserves on the cluster cannot drift from the set AiiDA pulls back.  A file
+    that is retrieved is by definition one the parser may read; deleting
+    anything else is invisible to every downstream node, which is what makes
+    ``clean_scratch`` lossless rather than a second, quieter physics setting.
+    """
+    patterns = [*_SNAP_RETRIEVE, _CONTRIBUTIONS_GLOB] if do_aggregate else list(_SNAP_RETRIEVE)
+    prefix = "snap_*/"
+    return sorted({p[len(prefix) :] for p, _, _ in patterns if p.startswith(prefix)})
+
+
 # Fraction of the job's wallclock a single FEFF run may consume before the
 # driver kills it.  Without a bound one hung run holds a worker until the
 # scheduler kills the job, losing every result in the chunk.
@@ -158,6 +173,28 @@ class FeffBatchCalculation(CalcJob):
             valid_type=orm.Int,
             required=False,
             help="Parallel workers; defaults to the core count in metadata.options.resources.",
+        )
+        spec.input(
+            "clean_scratch",
+            valid_type=orm.Bool,
+            default=lambda: orm.Bool(False),
+            help=(
+                "Strip each snapshot directory of files that are not retrieved, on "
+                "the fly, once its spectrum is in batch_shard.h5. Removes the "
+                "feffNNNN.dat path files and potential binaries that dominate "
+                "scratch usage. Every retrieved file is kept, so parsed results are "
+                "unchanged; only the remote working directory shrinks."
+            ),
+        )
+        spec.input(
+            "stream_chunk_size",
+            valid_type=orm.Int,
+            default=lambda: orm.Int(256),
+            help=(
+                "Number of runs executed before their output is collected and "
+                "scratch is stripped. Bounds peak disk and inode usage at roughly "
+                "this many fully-populated run directories."
+            ),
         )
 
         spec.inputs["metadata"]["options"]["parser_name"].default = "feff.feff_batch"  # type: ignore[index]
@@ -323,6 +360,16 @@ class FeffBatchCalculation(CalcJob):
         else:
             n_workers_val = workers_from_resources(self.options.resources)
 
+        clean_scratch = self.inputs.clean_scratch.value
+        stream_chunk_size = self.inputs.stream_chunk_size.value
+
+        # One element per pair, in pair order. A single batch-wide symbol would
+        # mislabel every task whenever ``absorbing_atoms`` is an explicit index
+        # list spanning more than one species.
+        absorber_elements = [
+            absorber_element(frame_to_structure[f], s)
+            for f, s in zip(frame_indices, site_indices, strict=True)
+        ]
         batch_cfg = {
             "pairs": list(zip(frame_indices, site_indices, strict=True)),
             "feff_executable": feff_exe,
@@ -332,6 +379,10 @@ class FeffBatchCalculation(CalcJob):
             "do_aggregate": do_aggregate,
             "threshold": float(threshold),
             "run_timeout_seconds": self._run_timeout(),
+            "clean_scratch": clean_scratch,
+            "stream_chunk_size": stream_chunk_size,
+            "absorber_elements": absorber_elements,
+            "scratch_keep_files": _scratch_keep_files(do_aggregate),
         }
         with folder.open(BATCH_CONFIG, "wb") as fh:
             fh.write(as_lf_bytes(json.dumps(batch_cfg, indent=2)))

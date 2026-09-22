@@ -183,6 +183,101 @@ class TestDriverExitStatus:
         assert result.returncode != 0
         assert "batch_config.json" in result.stderr
 
+    def _run_driver(self, tmp_path, **config_overrides):
+        """Drive the batch script over a stand-in that writes chi.dat plus bulk."""
+        from aiida_feff.calculations import _run_batch
+
+        command = (
+            'python3 -c "import pathlib, numpy as np; p=pathlib.Path.cwd(); '
+            "(p/'chi.dat').write_text('# k chi\\n' + '\\n'.join(f'{k:.2f} {np.sin(k):.6f}' "
+            "for k in np.linspace(0.05, 20.0, 100))); (p/'log.dat').write_text('ok'); "
+            "(p/'xmu.dat').write_text('# xmu'); "
+            "[(p/f'feff{i:04d}.dat').write_text('bulk') for i in range(1, 6)]; "
+            "(p/'phase.pad').write_text('bulk')\""
+        )
+        config = {
+            "pairs": [[0, 0], [1, 0]],
+            "feff_executable": command,
+            "feff_prepend": "",
+            "feff_append": "",
+            "n_workers": 1,
+            "do_aggregate": False,
+            "threshold": 0.0,
+            "run_timeout_seconds": 30.0,
+            **config_overrides,
+        }
+        (tmp_path / BATCH_CONFIG).write_text(json.dumps(config))
+        return subprocess.run(
+            [sys.executable, str(Path(_run_batch.__file__))],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_clean_scratch_reclaims_bulk_but_keeps_retrieved_files(self, tmp_path):
+        """clean_scratch must remove only what the calcjob never retrieves.
+
+        The feffNNNN.dat path files and potential binaries are what exhaust
+        scratch; xmu.dat / chi.dat / log.dat are what the parser reads. Deleting
+        the latter would change parsed physics, so assert both halves.
+        """
+        keep = ["chi.dat", "files.dat", "log.dat", "paths.dat", "stderr.txt", "xmu.dat"]
+        res = self._run_driver(
+            tmp_path, clean_scratch=True, stream_chunk_size=1, scratch_keep_files=keep
+        )
+        assert res.returncode == 0, res.stderr
+        assert (tmp_path / "batch_shard.h5").exists()
+
+        for label in (_snap_label(0, 0), _snap_label(1, 0)):
+            snap = tmp_path / label
+            assert snap.is_dir(), "stripping must not remove the run directory itself"
+            assert (snap / "chi.dat").exists()
+            assert (snap / "xmu.dat").exists()
+            assert (snap / "log.dat").exists()
+            assert not list(snap.glob("feff[0-9]*.dat")), "path files should be reclaimed"
+            assert not (snap / "phase.pad").exists()
+            assert not (snap / "feff.inp").exists()
+
+    def test_clean_scratch_off_keeps_everything(self, tmp_path):
+        """The default must not delete anything -- an option that cleans when off is a trap."""
+        res = self._run_driver(tmp_path, clean_scratch=False, stream_chunk_size=1)
+        assert res.returncode == 0, res.stderr
+        snap = tmp_path / _snap_label(0, 0)
+        assert len(list(snap.glob("feff[0-9]*.dat"))) == 5
+        assert (snap / "phase.pad").exists()
+
+    def test_clean_scratch_without_keep_list_refuses_to_strip(self, tmp_path):
+        """An empty keep-set would delete the outputs; the driver must refuse."""
+        res = self._run_driver(
+            tmp_path, clean_scratch=True, stream_chunk_size=1, scratch_keep_files=[]
+        )
+        assert res.returncode != 0
+        assert "scratch_keep_files" in res.stderr
+        # Refused up front, before any FEFF ran, so nothing was produced to destroy.
+        assert not (tmp_path / _snap_label(0, 0)).exists()
+        assert not (tmp_path / "batch_shard.h5").exists()
+
+    def test_shard_is_identical_with_and_without_clean_scratch(self, tmp_path_factory):
+        """Stripping is lossless, so the shard contents must not depend on it."""
+        import h5py
+
+        keep = ["chi.dat", "files.dat", "log.dat", "paths.dat", "stderr.txt", "xmu.dat"]
+
+        def chis(clean):
+            d = tmp_path_factory.mktemp(f"clean_{clean}")
+            res = self._run_driver(
+                d, clean_scratch=clean, stream_chunk_size=1, scratch_keep_files=keep
+            )
+            assert res.returncode == 0, res.stderr
+            with h5py.File(d / "batch_shard.h5", "r") as f:
+                return {name: np.array(g["chi"]) for name, g in f["tasks"].items()}
+
+        on, off = chis(True), chis(False)
+        assert set(on) == set(off) and on
+        for name in on:
+            np.testing.assert_array_equal(on[name], off[name])
+
 
 @pytest.fixture()
 def batch_inputs(generate_trajectory, generate_feff_parameters, aiida_localhost):

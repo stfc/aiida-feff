@@ -87,6 +87,29 @@ a generated `feff.inp` across a pymatgen change is still worth doing.
   `workflows.ensemble.dynamic_outputs`; searching for the dotted form silently
   matches nothing.
 
+## `clean_scratch` must stay lossless
+
+The batch driver can strip each `snap_*` directory on the fly to stop
+`feffNNNN.dat` and the potential binaries exhausting scratch on long ensembles.
+The keep-set is *derived* from the calcjob's retrieve list
+(`feff_batch._scratch_keep_files`), never restated, so what survives on the
+cluster is exactly what AiiDA pulls back and the parser may read. Keep it that
+way: the moment stripping removes something retrievable, `clean_scratch`
+becomes a second physics setting wearing a disk-usage label.
+
+Concretely, letting the parser fall back to `batch_shard.h5` when `snap_*` is
+gone looks harmless and is not. The shard stores χ(k) only, resampled onto
+md-exafs' fixed 0.05–19.95 Å⁻¹ grid and **zero-filled** outside each run's own
+range. Reading it instead of the run directory drops μ(E), `mu_std` and E0,
+switches χ(k) from `autobk(xmu.dat)` to `chi.dat`, and defeats the NaN-masking
+in `_average_xas_data_impl` that exists precisely because zero-filling drags
+the mean toward zero at high k. That path was tried and removed.
+
+`tests/test_ensemble_run.py::test_clean_scratch_does_not_change_the_spectrum`
+runs the workchain twice and compares every array bit-for-bit. Any test that
+asserts only `n_snapshots` or the node type will pass while the spectrum
+changes underneath it.
+
 ## Minimum-image safety
 
 A neighbour cutoff above the cell's inscribed-sphere radius biases distances

@@ -502,4 +502,4 @@ class FeffCalculation(CalcJob):
                 config=cfg,
                 absorber_idx=absorbing_idx,
             )
-        return _generator_banner() + "\n\n" + inp_text
+        return _generator_banner() + f"\n* Absorber site index: {absorbing_idx}\n\n" + inp_text

@@ -388,6 +388,49 @@ class TestFailureHandling:
         # It must stop at the potentials stage, not fan out anyway.
         assert not [c for c in node.called if c.label.startswith("snap_")]
 
+    def test_partial_potentials_failure_allows_healthy_sites_to_continue(
+        self, tmp_path_factory, aiida_localhost, two_site_trajectory
+    ):
+        """When precompute fails on one site, healthy sites proceed and produce averages."""
+        from aiida_feff.data.parameters import FeffParameters
+
+        tmp = tmp_path_factory.mktemp("partial_potfeff")
+        # Stand-in that fails ONLY on site 1's potentials run
+        guard = textwrap.dedent("""\
+            #!/bin/bash
+            python3 - <<'CHECK' || exit 1
+            import sys
+            content = open("feff.inp").read()
+            is_pot = "1 1 1 0 0 0" in content
+            is_site_1 = "Absorber site index: 1" in content
+            if is_pot and is_site_1:
+                sys.exit(1)
+            sys.exit(0)
+            CHECK
+            """)
+        script = tmp / "partial_pot_feff.sh"
+        script.write_text(guard + FAKE_FEFF.split("\n", 1)[1])
+        script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        code = orm.InstalledCode(
+            label="partial-pot-feff", computer=aiida_localhost, filepath_executable=str(script)
+        ).store()
+
+        results, node = run_workchain(
+            code=code,
+            trajectory=two_site_trajectory,
+            precompute_potentials=orm.Bool(True),
+            parameters=FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atoms": "Fe"}),
+        )
+
+        assert not node.is_finished_ok
+        assert node.exit_status == EnsembleExafsWorkChain.exit_codes.ERROR_PARTIAL_FAILURE.status
+        assert results["n_failed"].value == 3
+        averaged = results["averaged_xas"]
+        assert "site_0000" in averaged
+        assert "site_0001" not in averaged
+        assert "all" in averaged
+        assert averaged["all"].base.attributes.get("n_snapshots") == 3
+
 
 @pytest.mark.usefixtures("aiida_profile_clean")
 class TestInputValidation:

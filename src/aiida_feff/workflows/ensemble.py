@@ -492,6 +492,8 @@ class EnsembleExafsWorkChain(WorkChain):
         else:
             site_indices = [int(params_dict.get("absorbing_atom", 0))]
         self.ctx.site_indices = site_indices
+        self.ctx.initial_site_indices = list(site_indices)
+        self.ctx.n_failed_precompute = 0
         self.report(f"Absorber site indices: {site_indices}")
 
     def should_precompute(self) -> bool:
@@ -569,10 +571,16 @@ class EnsembleExafsWorkChain(WorkChain):
 
         The parser recognises a potentials-only CONTROL card and returns 0 when
         ``xmu.dat`` is legitimately absent, so only exit status 0 is accepted
-        here.  Treating 310 as acceptable — as this used to — let a genuinely
-        crashed FEFF supply the potentials for every downstream job.
+        here.
+
+        Potentials are precomputed per absorber site and are independent of one another.
+        If all sites fail, the workchain aborts with ERROR_POTENTIALS_FAILED.
+        If a subset of sites fail, they are logged and dropped, and the remaining
+        usable sites continue.
         """
         pot_remote: dict[int, orm.RemoteData] = {}
+        usable_sites: list[int] = []
+        failed_sites: list[int] = []
 
         for site_idx in self.ctx.site_indices:
             label = f"pot_site_{site_idx:04d}"
@@ -582,15 +590,32 @@ class EnsembleExafsWorkChain(WorkChain):
                     f"Potentials run for site {site_idx} ({child.pk}) failed "
                     f"with exit status {child.exit_status}."
                 )
-                return self.exit_codes.ERROR_POTENTIALS_FAILED.format(  # type: ignore[no-any-return]
-                    site_idx=site_idx
+                failed_sites.append(site_idx)
+            else:
+                pot_remote[site_idx] = child.outputs.remote_folder
+                usable_sites.append(site_idx)
+                self.report(
+                    f"Potentials for site {site_idx} ready "
+                    f"(remote pk={child.outputs.remote_folder.pk})."
                 )
-            pot_remote[site_idx] = child.outputs.remote_folder
-            self.report(
-                f"Potentials for site {site_idx} ready "
-                f"(remote pk={child.outputs.remote_folder.pk})."
+
+        if not usable_sites:
+            self.report("All potential pre-computation runs failed.")
+            return self.exit_codes.ERROR_POTENTIALS_FAILED.format(  # type: ignore[no-any-return]
+                site_idx=failed_sites[0] if len(failed_sites) == 1 else failed_sites
             )
 
+        if failed_sites:
+            self.report(
+                f"Potential precomputation failed for {len(failed_sites)} of "
+                f"{len(self.ctx.site_indices)} sites: {failed_sites}. "
+                "These sites will be skipped; continuing with remaining sites."
+            )
+            self.ctx.n_failed_precompute = len(failed_sites) * len(self.ctx.structures)
+        else:
+            self.ctx.n_failed_precompute = 0
+
+        self.ctx.site_indices = usable_sites
         self.ctx.pot_remote = pot_remote
 
     def submit_batch_calculations(self):
@@ -613,7 +638,8 @@ class EnsembleExafsWorkChain(WorkChain):
                 job_pairs.append((i, site_idx))
 
         self.ctx.job_pairs = job_pairs
-        self.ctx.n_total = len(job_pairs)
+        initial_sites = getattr(self.ctx, "initial_site_indices", self.ctx.site_indices)
+        self.ctx.n_total = len(self.ctx.structures) * len(initial_sites)
 
         # Convert the structures we will actually use into a single TrajectoryData.
         # The batch CalcJob receives frame indices into this packed trajectory, so
@@ -717,7 +743,7 @@ class EnsembleExafsWorkChain(WorkChain):
         self.ctx.per_site_xas = per_site
         self.ctx.all_xas = all_xas
         self.ctx.successful_paths = successful_paths
-        self.ctx.n_failed = n_failed
+        self.ctx.n_failed = n_failed + getattr(self.ctx, "n_failed_precompute", 0)
         self.ctx.shards = shards
 
     def submit_feff_calculations(self):
@@ -770,7 +796,8 @@ class EnsembleExafsWorkChain(WorkChain):
                 )
 
         self.ctx.job_pairs = job_pairs
-        self.ctx.n_total = len(job_pairs)
+        initial_sites = getattr(self.ctx, "initial_site_indices", self.ctx.site_indices)
+        self.ctx.n_total = len(self.ctx.structures) * len(initial_sites)
         return ToContext(**calcs)  # type: ignore[arg-type]
 
     def inspect_results(self) -> None:
@@ -804,7 +831,7 @@ class EnsembleExafsWorkChain(WorkChain):
         self.ctx.per_site_xas = per_site
         self.ctx.all_xas = all_xas
         self.ctx.successful_paths = successful_paths
-        self.ctx.n_failed = n_failed
+        self.ctx.n_failed = n_failed + getattr(self.ctx, "n_failed_precompute", 0)
         # FeffCalculation writes no batch_shard.h5, so the consolidated 'archive'
         # output is only produced on the batch path.
         self.ctx.shards = {}

@@ -328,10 +328,14 @@ def main(
     from md_exafs.debye_waller import calculate_grouped_msrd
 
     # The cutoff must stay inside the cell's inscribed sphere, or the
-    # minimum-image convention aliases neighbours and biases σ² low.
+    # minimum-image convention aliases neighbours and biases σ² low. The
+    # conventional BCC cell is 2.87 Å, so its limit is 1.435 Å while the first
+    # Fe-Fe shell sits at a√3/2 = 2.486 Å: no legal cutoff reaches the shell we
+    # want. Enlarge the cell rather than the cutoff. Repeating leaves atom 0
+    # where it was, so it is still the absorber the spectra were computed for.
     from aiida_feff.utils import trajectory_to_structures
 
-    structures = [s.get_ase() for s in trajectory_to_structures(traj)]
+    structures = [s.get_ase().repeat((2, 2, 2)) for s in trajectory_to_structures(traj)]
     two_body, three_body = calculate_grouped_msrd(
         structures,
         central_indices=[0],
@@ -339,9 +343,11 @@ def main(
         cutoff=2.7,
     )
     click.echo(f"  {len(two_body)} two-body and {len(three_body)} three-body path groups")
+    # "type" is the path label, e.g. Fe-O. calculate_grouped_msrd has never
+    # emitted a "scatterer" key, in 0.2 or 0.3.
     for group in sorted(two_body, key=lambda g: g["reff"])[:5]:
         click.echo(
-            f"    {group['scatterer']:>4s}  reff={group['reff']:.3f} Å"
+            f"    {group['type']:>8s}  reff={group['reff']:.3f} Å"
             f"  σ²={group['sigma2']:.5f} Å²  n={group['count']}"
         )
 

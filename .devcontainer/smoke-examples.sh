@@ -50,6 +50,15 @@ grep -q "path_contributions pk=" serial.log || fail "--store-paths produced no p
 grep -q "archive pk=" serial.log || fail "serial route produced no archive"
 grep -q "ensemble=True" serial.log || fail "serial archive is not an ensemble archive"
 grep -q "merged from 1 shard(s)" serial.log || fail "serial route wrote no shard"
+# The Debye-Waller step reads md-exafs' grouped-MSRD dicts by key, and a
+# renamed key there surfaces as a KeyError three quarters of the way through
+# a run that has already spent minutes in FEFF. Assert the line it prints.
+grep -qE "Fe-Fe +reff=2\.[0-9]+ " serial.log || fail "no Fe-Fe Debye-Waller group"
+# A cutoff past the cell's inscribed sphere aliases neighbours and biases
+# sigma^2 low. md-exafs warns rather than raising, so the warning has to fail
+# the build or the example silently reports wrong physics.
+! grep -q "exceeds the maximum safe MIC cutoff" serial.log \
+  || fail "Debye-Waller cutoff exceeds the minimum-image limit"
 
 run "example_ensemble_synthetic.py — batch mode"
 uv run --project "$REPO" python "$REPO/examples/example_ensemble_synthetic.py" \

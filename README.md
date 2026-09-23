@@ -18,14 +18,14 @@ including ensemble averaging over MD snapshots via
 | Component | Description |
 |-----------|-------------|
 | `FeffCalculation` | CalcJob wrapping a single FEFF run; builds `feff.inp` from `StructureData` + `FeffParameters` |
-| `FeffParser` | Parses `xmu.dat` and `chi.dat` into `XasData` output nodes |
+| `FeffParser` | Parses `chi.dat` into `XasData` output nodes |
 | `FeffBatchCalculation` | CalcJob that runs *N* FEFF instances in one Slurm job (one per core); for HPC ensemble runs |
 | `FeffBatchParser` | Parses all per-snapshot outputs from a batch job into a dynamic namespace of `XasData` nodes |
 | `FeffParameters` | Validated `Dict` subclass for FEFF control cards |
-| `XasData` | `ArrayData` subclass storing μ(E) and χ(k) spectra |
-| `EnsembleExafsWorkChain` | Fan-out over MD snapshots → ensemble-averaged χ(k); supports both single-job and batch modes |
-| `calcfunctions` | Larch post-processing (FT), and Debye-Waller extraction |
-| `visualise` | Matplotlib helpers for μ(E), χ(k), and χ(R) plots |
+| `XasData` | `ArrayData` subclass storing χ(k), plus μ(E) on experimental imports |
+| `EnsembleExafsWorkChain` | Fan-out over MD snapshots → one `ExafsArchiveData` and ensemble-averaged χ(k); single-job and batch modes |
+| `calcfunctions` | Larch post-processing (FT), archive projection, experimental imports |
+| `visualise` | Matplotlib helpers for χ(k) and χ(R) plots |
 
 ## Installation
 
@@ -235,7 +235,7 @@ before calling FEFF, so the SCF step is skipped for every snapshot.
 **Partial failures are isolated.**
 If an individual FEFF run crashes, the driver logs the error and continues with
 the remaining runs.  The batch job exits 0.  The parser detects missing
-`xmu.dat` files and skips those pairs; the workchain counts them as failures
+`chi.dat` files and skips those pairs; the workchain counts them as failures
 and produces a partial average (exit code 301) rather than aborting entirely.
 
 #### Setup: register codes on the HPC
@@ -395,10 +395,7 @@ chir = chi_k_to_r(xas_data=xas, ft_params=Dict({"kmin":3, "kmax":14, "kweight":2
 ### 6. Plotting (optional)
 
 ```python
-from aiida_feff.visualise import plot_mu_e, plot_chi_k, plot_chi_r
-
-# μ(E)
-fig = plot_mu_e(xas)
+from aiida_feff.visualise import plot_chi_k, plot_chi_r
 
 # k²χ(k)
 fig = plot_chi_k(xas, kweight=2)
@@ -477,8 +474,10 @@ EnsembleExafsWorkChain
   ├─ FeffCalculation × (N_frames × N_sites) ← one Slurm job each
   │    └─ FeffParser → XasData
   │
-  └─ average_xas_data (calcfunction)
-       └─ averaged XasData per site + grand average
+  ├─ create_serial_shard (calcfunction) → one shard, as the batch driver writes
+  │
+  └─ merge_exafs_shards (calcfunction) → ExafsArchiveData (archive)
+       └─ archive_to_averaged_xas (calcfunction) → averaged XasData per site + grand average
 ```
 
 ### Batch mode (HPC, hundreds of calculations)
@@ -501,9 +500,12 @@ EnsembleExafsWorkChain (batch_size=64)
   ├─ FeffBatchCalculation             ← next chunk, another Slurm job
   │    └─ …
   │
-  └─ average_xas_data (calcfunction)
-       └─ averaged XasData per site + grand average
+  └─ merge_exafs_shards (calcfunction) → ExafsArchiveData (archive)
+       └─ archive_to_averaged_xas (calcfunction) → averaged XasData per site + grand average
 ```
+
+Both routes end at the same merge, so the ensemble average has one
+implementation and `archive` is always produced.
 
 The FEFF environment (module loads, etc.) is read from `feff_code.prepend_text`
 at AiiDA submission time and embedded in `batch_config.json`.  On the compute

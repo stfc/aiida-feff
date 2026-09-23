@@ -59,8 +59,11 @@ a generated `feff.inp` across a pymatgen change is still worth doing.
 - Multiple-scattering `reff` is half the total path length, per FEFF. The
   larch oracle in `test_exafs.py` covers one MS path (`feff0007.dat`,
   `nlegs=3`) for exactly this reason; keep an MS path in `ORACLE_DATS`.
-- `XasData.energy` holds FEFF's `omega` column, energy **relative to E0**;
-  `XasData.absolute_energy` adds `e0` back.
+- A FEFF-produced `XasData` holds χ(k) alone, read from `chi.dat`. `xmu.dat`
+  is not retrieved and larch's `autobk` is not run over simulated data, so
+  `XasData.energy`, `.mu` and a meaningful `.e0` exist only on experimental
+  imports (`calcfunctions.experimental`). Check `get_arraynames()` before
+  reaching for μ(E).
 - Fourier-transform defaults, including `window="kaiser"`, are re-exported
   as `calcfunctions.larch.FT_DEFAULTS` from `md_exafs.spectra`. `xftf_arrays` is the only call site of
   larch's `xftf`; route new transforms through it rather than adding a fourth.
@@ -98,17 +101,59 @@ way: the moment stripping removes something retrievable, `clean_scratch`
 becomes a second physics setting wearing a disk-usage label.
 
 Concretely, letting the parser fall back to `batch_shard.h5` when `snap_*` is
-gone looks harmless and is not. The shard stores χ(k) only, resampled onto
-md-exafs' fixed 0.05–19.95 Å⁻¹ grid and **zero-filled** outside each run's own
-range. Reading it instead of the run directory drops μ(E), `mu_std` and E0,
-switches χ(k) from `autobk(xmu.dat)` to `chi.dat`, and defeats the NaN-masking
-in `_average_xas_data_impl` that exists precisely because zero-filling drags
-the mean toward zero at high k. That path was tried and removed.
+gone looks harmless and is not. The shard holds χ(k) resampled onto md-exafs'
+fixed 0.05–19.95 Å⁻¹ grid, which is lossy whenever FEFF's own grid differs,
+and it holds no `paths.dat` or `files.dat` for the path machinery to read.
+Retrieving the run directory and reading the shard are not interchangeable.
+That path was tried and removed.
 
 `tests/test_ensemble_run.py::test_clean_scratch_does_not_change_the_spectrum`
 runs the workchain twice and compares every array bit-for-bit. Any test that
 asserts only `n_snapshots` or the node type will pass while the spectrum
 changes underneath it.
+
+## One χ(k) grid, two ways to fall off it
+
+Every spectrum reaching the archive is resampled onto md-exafs'
+`DEFAULT_K_GRID` (0.05–19.95 Å⁻¹), because spectra have to share a grid before
+they can be averaged and FEFF's own grid follows the `EXAFS` k_max card. Two
+failure modes hide in that resampling and they need opposite treatment, which
+is why `md_exafs.spectra.resample_chi` owns it and nothing else calls
+`np.interp` on χ(k):
+
+- A destination point beyond the source by **less than half a source step** is
+  grid registration, not missing data. FEFF writes `chi.dat` with 400 or 401
+  rows depending on whether its grid starts at k=0, and `np.arange(0.05, 20.0,
+  0.05)` overshoots its own last point by 3.6e-15. `resample_chi` carries the
+  endpoint value across. `DEFAULT_K_GRID` is now built by exact division so
+  the overshoot does not arise in the first place.
+- Anything further out is a genuinely shorter run. It becomes NaN,
+  `average_chi_arrays` masks it, and `n_contributors` records the coverage.
+
+NaN then must not reach larch. `xftf` multiplies by the window, `0 * nan` is
+`nan`, and one uncovered point anywhere on the grid turns **every** χ(R) value
+into NaN. `xftf_arrays` zero-fills before transforming, which is what a
+finite-range Fourier transform does anyway, and warns when the uncovered k
+fall inside the window — there the zeros damp |χ(R)| and the answer is to
+lower `kmax`, not to ignore it.
+
+`tests/test_ensemble_run.py::TestShortChiDat` runs the workchain against a
+stand-in whose `chi.dat` stops at k=14. The default stand-in writes exactly
+`DEFAULT_K_GRID`, so it cannot see any of this.
+
+## Averaging χ(k) has one implementation
+
+`md_exafs.spectra.average_chi_arrays` is it. Four call sites used to
+interpolate and combine spectra themselves, with three different conventions
+for k outside a member's range, and the differences were invisible until an
+ensemble came out ragged. Both execution routes now converge on it: the batch
+driver writes shards, `create_serial_shard` writes the serial equivalent, and
+`merge_exafs_shards` averages either into the `archive`. The `averaged_xas`
+outputs are a *projection* of that archive via `archive_to_averaged_xas`, not
+a second average over the per-snapshot nodes.
+
+Reimplementing the mean "just for a plot" is how the two answers drift apart;
+`aiidalab-exafs` had such a copy and it is gone.
 
 ## Minimum-image safety
 
@@ -155,7 +200,7 @@ to itself and cannot fail — `tests/test_numerical_parity.py` did exactly that
 and was deleted. Test the delta this plugin adds (provenance, node
 attributes, AiiDA plumbing, negative-index rejection), and keep the larch
 oracle as an integration guard against an md-exafs regression. `md-exafs` is
-capped at `<0.3` so a physics-affecting bump has to be a deliberate PR here.
+capped at `<0.4` so a physics-affecting bump has to be a deliberate PR here.
 
 ### The FEFF stand-in must read its input
 

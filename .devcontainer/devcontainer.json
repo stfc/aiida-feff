@@ -44,7 +44,17 @@
   // submitted processes sit in 'created' forever with no obvious cause.
   "postStartCommand": "uv run verdi daemon start 2 || true",
   "remoteUser": "vscode",
-  "updateRemoteUserUID": false,
+  // Remap vscode to the UID that owns the workspace on the host. The bind
+  // mount carries host ownership on Linux, and vscode is 1000, so anywhere
+  // the host user is not 1000 the workspace is read-only to the container:
+  // the editable install cannot write src/aiida_feff.egg-info, pre-commit
+  // cannot write .git/hooks, and pytest cannot write .pytest_cache. The CI
+  // runner owns its checkout as 1001, which is exactly that case.
+  //
+  // This is the spec default, and chowning /workspace instead is the trap
+  // described in post-create.sh. No-op on macOS and Windows, where bind
+  // mounts do not carry host UIDs, and on any host already running as 1000.
+  "updateRemoteUserUID": true,
   "forwardPorts": [8888],
   "portsAttributes": {
     "8888": { "label": "Jupyter" }

@@ -21,9 +21,15 @@ git config core.filemode false || true
 # NB: there is deliberately no chown of /workspace here. The previous version
 # chowned everything *except* .git, so in the one situation it triggered --
 # the workspace being unwritable due to a UID mismatch -- .git stayed
-# unwritable and every subsequent git operation failed. Ownership is now
-# handled by keeping the venv out of the bind mount (see docker-compose.yml)
-# and by userns_mode for Podman users (docker-compose.podman.yml).
+# unwritable and every subsequent git operation failed.
+#
+# Workspace ownership is handled before this script runs, by
+# updateRemoteUserUID in devcontainer.json, which remaps vscode to the UID
+# owning the mount. That is what lets the editable install write
+# src/aiida_feff.egg-info, pre-commit write .git/hooks, and pytest write
+# .pytest_cache. Keeping the venv out of the bind mount (docker-compose.yml)
+# and userns_mode for Podman (docker-compose.podman.yml) are separate
+# concerns and neither covers those three.
 
 # ── 0a. Take ownership of the named volumes ─────────────────────────────────
 # A named volume whose mount point does not already exist in the image is

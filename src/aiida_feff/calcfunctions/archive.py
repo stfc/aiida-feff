@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from aiida.engine import calcfunction
 from md_exafs.execution import merge_shards
@@ -78,10 +79,41 @@ def create_serial_shard(**kwargs) -> ExafsArchiveData:
                     site_idx=node.base.attributes.get("site_index"),
                     absorber_element=node.base.attributes.get("absorber_element"),
                     chi=resample_chi(node.get_array("k"), node.get_array("chi_k"), DEFAULT_K_GRID),
-                    paths=list(paths_node.iter_paths()) if paths_node else None,
+                    paths=_as_shard_paths(paths_node) if paths_node else None,
                 )
 
         return ExafsArchiveData(file=str(out_shard))
+
+
+def _as_shard_paths(node: Any) -> list[Any]:
+    """Convert this package's ``PathResult`` into the one md-exafs writes.
+
+    Two different dataclasses carry that name.  md-exafs' has ``angle`` and
+    ``path_index``; the one :meth:`PathContributionsData.iter_paths` yields
+    has neither, and :meth:`BatchShardWriter.add_task_result` reads ``angle``.
+    Handing ours straight over raises ``AttributeError`` at write time, so the
+    import is aliased here to keep the two visibly distinct.
+
+    aiida-feff records no scattering angle anywhere, so it stays ``None`` and
+    the writer stores its -1.0 "unset" sentinel.
+    """
+    from md_exafs.paths import PathResult as ShardPathResult
+
+    return [
+        ShardPathResult(
+            frame_idx=p.frame_idx,
+            site_idx=p.site_idx,
+            r_eff=p.r_eff,
+            nlegs=p.nlegs,
+            degeneracy=p.degeneracy,
+            scatterer=p.scatterer,
+            cw_ratio=p.cw_ratio,
+            k=p.k,
+            feff_data=p.feff_data,
+            sig2=p.sig2,
+        )
+        for p in node.iter_paths()
+    ]
 
 
 __all__ = [

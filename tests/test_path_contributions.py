@@ -485,3 +485,70 @@ class TestAgainstRealFeffOutput:
         multiple = [p.r_eff for p in aggregated_node.iter_paths() if p.nlegs > 2]
         assert single and multiple
         assert min(multiple) > min(single)
+
+
+# ---------------------------------------------------------------------------
+# create_serial_shard — the serial route's path handover
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("aiida_profile_clean")
+class TestSerialShardPathHandover:
+    """The serial route hands paths to md-exafs' shard writer.
+
+    Two dataclasses are called ``PathResult``: the one this package yields from
+    ``iter_paths`` and the one ``BatchShardWriter`` consumes. They differ, so
+    the handover has to convert. Passing ours through unchanged raised
+    ``AttributeError: 'PathResult' object has no attribute 'angle'`` deep inside
+    a calcfunction, and no unit test reached it because nothing here ran the
+    serial ensemble with path storage on.
+    """
+
+    def _xas_node(self, frame_idx: int = 0, site_idx: int = 0):
+        from md_exafs.execution import DEFAULT_K_GRID
+
+        from aiida_feff.data.xasdata import XasData
+
+        xas = XasData()
+        xas.set_chi(DEFAULT_K_GRID, np.sin(2.0 * DEFAULT_K_GRID))
+        xas.base.attributes.set("frame_index", frame_idx)
+        xas.base.attributes.set("site_index", site_idx)
+        xas.base.attributes.set("absorber_element", "Fe")
+        return xas.store()
+
+    def test_paths_reach_the_shard(self):
+        from aiida_feff.calcfunctions.archive import create_serial_shard
+
+        pc = _make_pc_node(frame_idx=0, site_idx=0, n_paths=3).store()
+        shard = create_serial_shard(
+            xas__snap_0000_site_0000=self._xas_node(),
+            paths__snap_0000_site_0000=pc,
+        )
+
+        stored = shard.iter_paths()
+        assert len(stored) == 3
+        # r_eff survives the conversion, so the paths are the ones we sent and
+        # not an empty set quietly written because the node was skipped.
+        assert sorted(round(p.r_eff, 2) for p in stored) == [2.48, 2.98, 3.48]
+
+    def test_missing_angle_becomes_the_unset_sentinel(self):
+        """aiida-feff records no scattering angle, and must not invent one."""
+        from aiida_feff.calcfunctions.archive import create_serial_shard
+
+        pc = _make_pc_node(n_paths=1).store()
+        shard = create_serial_shard(
+            xas__snap_0000_site_0000=self._xas_node(),
+            paths__snap_0000_site_0000=pc,
+        )
+
+        with shard.reader() as reader, reader._open() as f:
+            angles = np.array(f["tasks/frame_0000_site_0000/paths/angle"])
+        assert np.all(angles == -1.0)
+
+    def test_shard_is_written_without_paths(self):
+        """path storage is optional; the spectrum still has to get through."""
+        from aiida_feff.calcfunctions.archive import create_serial_shard
+
+        shard = create_serial_shard(xas__snap_0000_site_0000=self._xas_node())
+        assert shard.is_shard
+        assert np.isfinite(shard.chi).all()

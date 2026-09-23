@@ -439,6 +439,14 @@ class EnsembleExafsWorkChain(WorkChain):
             "ERROR_MISSING_AGGREGATION_CODE",
             message="batch_size requires python_code to be set (used as Python runner).",
         )
+        spec.exit_code(
+            304,
+            "ERROR_NO_ARCHIVE",
+            message=(
+                "{n_ok} snapshot spectra were produced but no shard reached "
+                "merge_exafs_shards, so there is no ensemble archive and no averaged_xas."
+            ),
+        )
 
         # aiida-core types outline steps as ``Callable[[WorkChain], ...]``, which
         # no subclass method can satisfy; going through an untyped alias keeps
@@ -901,31 +909,45 @@ class EnsembleExafsWorkChain(WorkChain):
 
         # Consolidate shards into one ensemble archive (ADR 0004).
         # Written on both batch and serial paths.
-        if self.ctx.shards:
-            ensemble_archive = merge_exafs_shards(
-                metadata={
-                    "call_link_label": "merge_shards",
-                    "label": "ensemble_archive",
-                },
-                **self.ctx.shards,
+        #
+        # There being no shard at all, with spectra in hand, is a failure and
+        # not a quiet omission.  ``averaged_xas`` is a required output, but it
+        # is a dynamic namespace with no declared children, so plumpy's
+        # required-output check passes on an empty one and the workchain would
+        # otherwise finish at exit 0 having produced no ensemble average --
+        # the batch driver swallowing an md-exafs ImportError, and retrieval
+        # tolerating the missing batch_shard.h5, both land here.
+        if not self.ctx.shards:
+            self.report(
+                f"No shard reached merge_exafs_shards though {n_ok} snapshots produced "
+                "spectra; there is no ensemble archive to average."
             )
-            self.out("archive", ensemble_archive)
+            return self.exit_codes.ERROR_NO_ARCHIVE.format(n_ok=n_ok)  # type: ignore[no-any-return]
 
-            # The averaged_xas outputs are a projection of the archive, not a
-            # second average over the per-snapshot nodes, so there is one
-            # ensemble average in the graph and one place it can be wrong.
-            averaged_nodes = archive_to_averaged_xas(
-                ensemble_archive,
-                # AiiDA injects metadata into every calcfunction; the signature
-                # stays narrow so a stray keyword cannot become a silent,
-                # ignored provenance input.
-                metadata={  # type: ignore[call-arg]
-                    "call_link_label": "project_averaged_xas",
-                    "label": "projected_averaged_xas",
-                },
-            )
-            for key, xas_node in averaged_nodes.items():
-                self.out(f"averaged_xas.{key}", xas_node)
+        ensemble_archive = merge_exafs_shards(
+            metadata={
+                "call_link_label": "merge_shards",
+                "label": "ensemble_archive",
+            },
+            **self.ctx.shards,
+        )
+        self.out("archive", ensemble_archive)
+
+        # The averaged_xas outputs are a projection of the archive, not a
+        # second average over the per-snapshot nodes, so there is one
+        # ensemble average in the graph and one place it can be wrong.
+        averaged_nodes = archive_to_averaged_xas(
+            ensemble_archive,
+            # AiiDA injects metadata into every calcfunction; the signature
+            # stays narrow so a stray keyword cannot become a silent,
+            # ignored provenance input.
+            metadata={  # type: ignore[call-arg]
+                "call_link_label": "project_averaged_xas",
+                "label": "projected_averaged_xas",
+            },
+        )
+        for key, xas_node in averaged_nodes.items():
+            self.out(f"averaged_xas.{key}", xas_node)
 
         if "group_label" in self.inputs:
             label = self.inputs.group_label.value

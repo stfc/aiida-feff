@@ -59,19 +59,29 @@ class TestPlotChiR:
         with pytest.raises(TypeError, match="Expected XasData or ArrayData"):
             plot_chi_r(Int(1))
 
-    def test_inline_and_tracked_transforms_agree(self, generate_xas_data, aiida_profile):
-        """One FT implementation, so a plot cannot disagree with provenance."""
+    def test_the_plotted_curve_matches_the_tracked_transform(
+        self, generate_xas_data, aiida_profile
+    ):
+        """One FT implementation, so a plot cannot disagree with provenance.
+
+        Asserted through the curve that reaches matplotlib rather than through
+        a helper, because the helper is what a refactor moves and the drawn
+        line is what a reader believes.
+        """
         import numpy as np
 
         from aiida_feff.calcfunctions.larch import chi_k_to_r
-        from aiida_feff.visualise import _xftf_inline
+        from aiida_feff.visualise import plot_chi_r
 
         xas = generate_xas_data()
         ft = {"kmin": 2.0, "kmax": 12.0, "kweight": 2}
         tracked = chi_k_to_r(xas, Dict(ft))
-        r, mag, _re, _im, _params = _xftf_inline(xas, ft)
-        np.testing.assert_allclose(r, tracked.get_array("r"))
-        np.testing.assert_allclose(mag, tracked.get_array("chir_mag"))
+
+        fig = plot_chi_r(xas, ft_params=ft, component="mag")
+        r_plotted, mag_plotted = fig.axes[0].lines[-1].get_data()
+
+        np.testing.assert_allclose(r_plotted, tracked.get_array("r"))
+        np.testing.assert_allclose(mag_plotted, tracked.get_array("chir_mag"))
 
 
 class TestPlotStyling:

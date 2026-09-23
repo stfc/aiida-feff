@@ -100,21 +100,26 @@ class FeffParser(Parser):
             return self.exit_codes.ERROR_MISSING_CHIDAT  # type: ignore[no-any-return]
 
         # Where in the trajectory this spectrum came from, and what absorbed.
-        # create_serial_shard reads these back when it assembles the archive,
-        # so a missing or wrong value here becomes a mislabelled snapshot
-        # there rather than a visible failure.  The element comes from
+        # create_serial_shard reads all three back when it assembles the
+        # archive, so a missing or wrong value here becomes a mislabelled
+        # snapshot there rather than a visible failure.  The element comes from
         # ``parameters.absorbing_atom``, which is what FEFF actually ran on;
         # ``site_idx`` is the ensemble's bookkeeping index and the two only
         # coincide because EnsembleExafsWorkChain sets both.
-        xas.base.attributes.set(
-            "absorber_element",
-            absorber_element(
-                self.node.inputs.structure,
-                self.node.inputs.parameters.get("absorbing_atom", 0),
-            ),
-        )
-        xas.base.attributes.set("site_index", int(self.node.inputs.site_idx.value))
-        xas.base.attributes.set("frame_index", int(self.node.inputs.frame_idx.value))
+        #
+        # All three or none.  A run driven by a verbatim ``feff_input_file``
+        # has no structure and no parameters, so it has no absorber to name,
+        # and its frame and site would be port defaults dressed up as facts.
+        # Writing the label piecemeal would let a reader take two plausible
+        # numbers and then hit AttributeError on the third.
+        inputs = self.node.inputs
+        if "structure" in inputs and "parameters" in inputs:
+            xas.base.attributes.set(
+                "absorber_element",
+                absorber_element(inputs.structure, inputs.parameters.get("absorbing_atom", 0)),
+            )
+            xas.base.attributes.set("site_index", int(inputs.site_idx.value))
+            xas.base.attributes.set("frame_index", int(inputs.frame_idx.value))
 
         self.out("xas_data", xas)
 

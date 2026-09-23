@@ -87,12 +87,15 @@ uv run --project "$REPO" python "$REPO/examples/example_ensemble_synthetic.py" \
 grep -q "precomputing scattering potentials" pot.log || fail "potentials step was not engaged"
 
 run "example_ensemble.py — against a stored trajectory"
-TRAJ_PK=$(uv run --project "$REPO" python - <<'PY'
+TRAJ_PK=$(REPO="$REPO" uv run --project "$REPO" python - <<'PY'
+import os
 import sys
 
 from aiida import load_profile
 
-sys.path.insert(0, "/workspace/examples")
+# Through the environment, not interpolated: the heredoc is quoted so that the
+# Python below cannot be mangled by the shell, and $REPO is overridable.
+sys.path.insert(0, os.path.join(os.environ["REPO"], "examples"))
 load_profile()
 from example_ensemble_synthetic import make_trajectory
 

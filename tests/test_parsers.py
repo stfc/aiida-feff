@@ -123,6 +123,46 @@ class TestFeffParserIntegration:
         )
         assert result.exit_status == FeffCalculation.exit_codes.ERROR_MISSING_CHIDAT.status
 
+    def test_a_verbatim_input_run_still_yields_a_spectrum(self, parse_retrieved):
+        """A run from a supplied feff.inp has no structure and no parameters.
+
+        Both ports are ``required=False`` and ``_validate_inputs`` accepts
+        ``feff_input_file`` alone, so this node shape is reachable.  Reading
+        ``inputs.structure`` unconditionally raised ``NotExistentAttributeError``
+        inside the parser, which the blanket ``except`` in ``parse`` turned into
+        exit 400 for a run that had in fact produced a perfectly good chi.dat.
+        """
+        from aiida.orm import SinglefileData  # noqa: PLC0415
+
+        result = parse_retrieved(
+            entry_point_name="feff.feff",
+            retrieved={"chi.dat": SAMPLE_CHI},
+            inputs={
+                "feff_input_file": SinglefileData(
+                    io.BytesIO(b"TITLE verbatim\n"), filename="feff.inp"
+                )
+            },
+            ensemble_inputs=False,
+        )
+        assert result.exit_status == 0
+        xas = result.outputs.xas_data
+        assert xas.get_array("chi_k").size
+        # Nothing places this spectrum in a trajectory, so it carries none of
+        # the three labels rather than two port defaults and a gap.
+        attrs = xas.base.attributes.all
+        assert not {"absorber_element", "site_index", "frame_index"} & set(attrs)
+
+    def test_a_generated_run_carries_the_whole_label(self, parse_retrieved):
+        """The fixture's default shape: structure and parameters both present."""
+        result = parse_retrieved(
+            entry_point_name="feff.feff",
+            retrieved={"chi.dat": SAMPLE_CHI},
+        )
+        attrs = result.outputs.xas_data.base.attributes.all
+        assert attrs["absorber_element"] == "Fe"
+        assert attrs["site_index"] == 0
+        assert attrs["frame_index"] == 0
+
 
 class TestPotentialsOnlyRuns:
     """A CONTROL card with modules 4-6 off legitimately produces no chi.dat."""
@@ -131,7 +171,7 @@ class TestPotentialsOnlyRuns:
     def _parameters(control):
         from aiida_feff.data.parameters import FeffParameters
 
-        return FeffParameters(dict={"edge": "K", "control": control})
+        return FeffParameters(dict={"edge": "K", "radius": 5.5, "control": control})
 
     def test_missing_chi_is_success_for_a_potentials_only_run(self, parse_retrieved):
         from aiida_feff.calculations.feff import CONTROL_POT_ONLY

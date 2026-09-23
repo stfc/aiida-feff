@@ -89,11 +89,6 @@ class ExafsArchiveData(SinglefileData):
         return ArchiveReader(self._cached_path()).chi
 
     @property
-    def chi_std(self) -> np.ndarray | None:
-        """Sample standard deviation of χ(k), if stored."""
-        return ArchiveReader(self._cached_path()).chi_std
-
-    @property
     def r(self) -> np.ndarray | None:
         """Fourier transform distance grid R (Å)."""
         return ArchiveReader(self._cached_path()).r
@@ -103,27 +98,9 @@ class ExafsArchiveData(SinglefileData):
         """Fourier transform magnitude |χ(R)|."""
         return ArchiveReader(self._cached_path()).chir_mag
 
-    @property
-    def chir_re(self) -> np.ndarray | None:
-        """Fourier transform real part."""
-        return ArchiveReader(self._cached_path()).chir_re
-
-    @property
-    def chir_im(self) -> np.ndarray | None:
-        """Fourier transform imaginary part."""
-        return ArchiveReader(self._cached_path()).chir_im
-
     def iter_paths(self) -> list[PathResult]:
         """Return all scattering paths stored in the archive."""
         return list(ArchiveReader(self._cached_path()).iter_paths())
-
-    def get_site_average(self, site_idx: int) -> dict[str, np.ndarray]:
-        """Return average spectra for a given site index."""
-        return ArchiveReader(self._cached_path()).get_site_average(site_idx)
-
-    def get_frame_average(self, frame_idx: int) -> dict[str, np.ndarray]:
-        """Return average spectra for a given frame index."""
-        return ArchiveReader(self._cached_path()).get_frame_average(frame_idx)
 
     def to_xas_data(self) -> XasData:
         """Project the grand average onto an unstored XasData node."""
@@ -137,7 +114,7 @@ class ExafsArchiveData(SinglefileData):
 
     def to_site_xas_data(self, site_idx: int) -> XasData:
         """Project one absorber site's average onto an unstored XasData node."""
-        site = self.get_site_average(site_idx)
+        site = ArchiveReader(self._cached_path()).get_site_average(site_idx)
         out = _as_xas_data(
             site["k"],
             site["chi"],

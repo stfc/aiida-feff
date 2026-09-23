@@ -55,6 +55,16 @@ VALID_KEYS = frozenset(
     }
 )
 
+#: Keys this node owns rather than forwards: they select the absorber, which is
+#: an argument to :func:`md_exafs.feff_input.build_feff_inp`, not a field of
+#: :class:`~md_exafs.feff_input.FeffConfig`.
+_AIIDA_ONLY_KEYS = frozenset({"absorbing_atom", "absorbing_atoms"})
+
+#: Keys forwarded verbatim to :class:`~md_exafs.feff_input.FeffConfig`.  Derived
+#: from :data:`VALID_KEYS` rather than restated, so a key added to the schema
+#: cannot be accepted here and then silently dropped on the way to FEFF.
+FEFF_CONFIG_KEYS = VALID_KEYS - _AIIDA_ONLY_KEYS
+
 #: Keys people reach for that this node does not implement, mapped to the name
 #: that actually works.  Used to turn a silent no-op into a pointed error.
 _KEY_ALIASES = {
@@ -84,8 +94,13 @@ class FeffParameters(Dict):
         Absorption edge — ``"K"``, ``"L1"`` … ``"M5"``.
     ``spectrum_type`` : str, default ``"EXAFS"``
         Currently only ``"EXAFS"`` is supported.
-    ``radius`` : float, default ``5.5``
-        Cluster / path radius in Å (FEFF ``RPATH`` card).
+    ``radius`` : float  *(required)*
+        Cluster radius in Å.  Sets both the cutoff that decides which atoms
+        enter the calculation and the FEFF ``RPATH`` card, so it is required
+        rather than defaulted: md-exafs ships 4.0 as its ``quick`` preset and
+        8.0 as ``publication``, which is the same key naming two different
+        calculations.  For BCC Fe, 4.0 Å gives a 15-atom cluster and 5.5 Å a
+        59-atom one.
     ``absorbing_atom`` : int, default ``0``
         0-based index of the absorbing site in the ``StructureData``.
     ``absorbing_atoms`` : int | str | list[int]
@@ -146,7 +161,14 @@ class FeffParameters(Dict):
             raise ValueError(f"spectrum_type must be 'EXAFS', got {st!r}")
 
         radius = d.get("radius")
-        if radius is not None and float(radius) <= 0:
+        if radius is None:
+            raise ValueError(
+                "'radius' is required.  It sets the cluster cutoff as well as the "
+                "RPATH card, so a default would silently choose how big the "
+                "calculation is: md-exafs uses 4.0 for its 'quick' preset and 8.0 "
+                "for 'publication'."
+            )
+        if float(radius) <= 0:
             raise ValueError(f"radius must be > 0, got {radius}")
 
         s02 = d.get("s02")
@@ -183,32 +205,18 @@ class FeffParameters(Dict):
 
     @property
     def radius(self) -> float:
-        """Cluster radius in Å."""
-        return float(self.get("radius", 5.5))
+        """Cluster radius in Å, the value FEFF will run at.
+
+        Required, so there is no default to disagree with md-exafs'.  There was
+        one: this node reported 5.5 while ``feff.inp`` was written at
+        ``FeffConfig``'s 4.0, which for BCC Fe is 59 atoms against 15.
+        """
+        return float(self["radius"])
 
     def to_feff_config(self) -> FeffConfig:
         """Convert stored dictionary to an md_exafs.FeffConfig instance."""
         d = self.get_dict()
-        # Filter keys relevant to FeffConfig
-        config_kwargs = {}
-        for key in (
-            "spectrum_type",
-            "edge",
-            "radius",
-            "exclude_hydrogen",
-            "control",
-            "print",
-            "s02",
-            "scf",
-            "exchange",
-            "nleg",
-            "exafs",
-            "criteria",
-            "delete_tags",
-        ):
-            if key in d:
-                config_kwargs[key] = d[key]
-        return FeffConfig(**config_kwargs)
+        return FeffConfig(**{key: d[key] for key in FEFF_CONFIG_KEYS if key in d})
 
     def to_pymatgen_user_tags(self) -> dict:
         """Build user_tag_settings dict delegating to FeffConfig."""
@@ -234,6 +242,7 @@ class FeffParameters(Dict):
 
 
 __all__ = [
+    "FEFF_CONFIG_KEYS",
     "FeffParameters",
     "VALID_EDGE_LABELS",
     "VALID_SPECTRUM_TYPES",

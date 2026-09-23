@@ -7,7 +7,7 @@ Uses ``generate_calc_job`` from aiida-core's testing utilities to exercise
 import pytest
 from aiida import orm
 
-from tests.helpers import atoms_rows, potentials_rows
+from tests.helpers import atoms_rows, is_float, potentials_rows
 
 
 @pytest.fixture()
@@ -195,7 +195,7 @@ class TestFeffInpGeneration:
         from aiida_feff.data.parameters import FeffParameters
 
         structure = generate_structure()
-        params = FeffParameters(dict={"edge": "K", "absorbing_atom": 0})
+        params = FeffParameters(dict={"edge": "K", "radius": 5.5, "absorbing_atom": 0})
         text = FeffCalculation.build_feff_inp(structure, params)
 
         absorbers = [row for row in atoms_rows(text) if row["ipot"] == 0]
@@ -217,7 +217,8 @@ class TestFeffInpGeneration:
         from aiida_feff.data.parameters import FeffParameters
 
         text = FeffCalculation.build_feff_inp(
-            generate_structure(), FeffParameters(dict={"edge": "K", "absorbing_atom": 0})
+            generate_structure(),
+            FeffParameters(dict={"edge": "K", "radius": 5.5, "absorbing_atom": 0}),
         )
         scatterers = [row for row in atoms_rows(text) if row["ipot"] != 0]
         assert scatterers, "ATOMS block has no scatterers"
@@ -245,12 +246,54 @@ class TestFeffInpGeneration:
         # ipots must be contiguous from 0, which is what FEFF requires.
         assert sorted(by_ipot) == list(range(len(by_ipot)))
 
+    @pytest.mark.parametrize("radius", [4.0, 6.5])
+    def test_radius_reaches_feff_inp_and_the_card_preview(self, generate_structure, radius):
+        """One radius, three readings, all of which have to agree.
+
+        ``to_feff_config`` forwards the key, ``build_feff_inp`` writes the
+        RPATH card, and ``to_feff_cards`` prints what ``verdi data feff export``
+        shows.  A forwarding gap put 4.0 in feff.inp while both readings here
+        said 5.5.
+        """
+        from aiida_feff.calculations.feff import FeffCalculation
+        from aiida_feff.data.parameters import FeffParameters
+
+        params = FeffParameters(dict={"edge": "K", "radius": radius})
+
+        text = FeffCalculation.build_feff_inp(generate_structure(), params)
+        rpath = [line.split() for line in text.splitlines() if line.strip().startswith("RPATH")]
+        assert len(rpath) == 1, f"expected one RPATH card, got {rpath}"
+        assert float(rpath[0][1]) == pytest.approx(radius)
+        assert params.radius == pytest.approx(radius)
+        assert any(
+            card.startswith("RPATH") and float(card.split()[1]) == pytest.approx(radius)
+            for card in params.to_feff_cards()
+        )
+
+    def test_radius_also_sets_the_cluster_cutoff(self, generate_structure):
+        """radius is not only the RPATH card, which is why it is required.
+
+        It goes to MPEXAFSSet as the cluster radius too, so the key decides
+        which atoms exist.  A default that moved 5.5 to 4.0 therefore shrank
+        the calculation rather than relabelling it.
+        """
+        from aiida_feff.calculations.feff import FeffCalculation
+        from aiida_feff.data.parameters import FeffParameters
+
+        def n_atoms(radius):
+            params = FeffParameters(dict={"edge": "K", "radius": radius})
+            return len(atoms_rows(FeffCalculation.build_feff_inp(generate_structure(), params)))
+
+        small, large = n_atoms(4.0), n_atoms(5.5)
+        assert small == 15
+        assert large == 59
+
     def test_scf_null_removes_scf_line(self, generate_structure):
         from aiida_feff.calculations.feff import FeffCalculation
         from aiida_feff.data.parameters import FeffParameters
 
         structure = generate_structure()
-        params = FeffParameters(dict={"edge": "K", "scf": None})
+        params = FeffParameters(dict={"edge": "K", "radius": 5.5, "scf": None})
         text = FeffCalculation.build_feff_inp(structure, params)
         assert "SCF" not in text
 
@@ -264,7 +307,9 @@ class TestExcludeHydrogen:
         from aiida_feff.data.parameters import FeffParameters
 
         structure = generate_h_bearing_structure()
-        params = FeffParameters(dict={"edge": "K", "absorbing_atom": 1, "exclude_hydrogen": True})
+        params = FeffParameters(
+            dict={"edge": "K", "radius": 5.5, "absorbing_atom": 1, "exclude_hydrogen": True}
+        )
         text = FeffCalculation.build_feff_inp(structure, params)
         assert " H " not in text and not any(
             line.strip().endswith(" H") for line in text.splitlines()
@@ -277,14 +322,16 @@ class TestExcludeHydrogen:
 
         structure = generate_h_bearing_structure()
         # H is index 0; Fe-at-origin is index 1. After stripping H, Fe-at-origin → index 0 (absorber).
-        params = FeffParameters(dict={"edge": "K", "absorbing_atom": 1, "exclude_hydrogen": True})
+        params = FeffParameters(
+            dict={"edge": "K", "radius": 5.5, "absorbing_atom": 1, "exclude_hydrogen": True}
+        )
         text = FeffCalculation.build_feff_inp(structure, params)
         origin_lines = [
             line
             for line in text.splitlines()
             if line.strip()
             and not line.startswith("*")
-            and all(abs(float(p)) < 1e-5 for p in line.split()[:3] if _is_float(p))
+            and all(abs(float(p)) < 1e-5 for p in line.split()[:3] if is_float(p))
             and "Fe" in line
         ]
         assert origin_lines, "Absorber (Fe) not found at origin in ATOMS block"
@@ -296,14 +343,8 @@ class TestExcludeHydrogen:
 
         structure = generate_h_bearing_structure()
         # H is at index 0
-        params = FeffParameters(dict={"edge": "K", "absorbing_atom": 0, "exclude_hydrogen": True})
+        params = FeffParameters(
+            dict={"edge": "K", "radius": 5.5, "absorbing_atom": 0, "exclude_hydrogen": True}
+        )
         with pytest.raises(ValueError, match="hydrogen"):
             FeffCalculation.build_feff_inp(structure, params)
-
-
-def _is_float(s):
-    try:
-        float(s)
-        return True
-    except ValueError:
-        return False

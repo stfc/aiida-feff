@@ -23,6 +23,12 @@ larch, absolute imports only, and self-contained — an `from aiida...` import
 there fails only at runtime, on the cluster, after the queue wait. Tests import
 them by file path via `tests/conftest.py::import_remote_script`.
 
+`_run_batch.py` adds md-exafs to that list, and only it: the shard it writes is
+what the ensemble average is built from, so batch mode cannot deliver without
+it. It checks for the import before starting any FEFF, because the alternative
+is a job that runs the whole batch and then has nothing to hand back.
+`_aggregate_paths.py` has no such dependency.
+
 ## The code/feff_code inversion
 
 `FeffCalculation.code` is the FEFF binary. `FeffBatchCalculation.code` is the
@@ -69,6 +75,12 @@ a generated `feff.inp` across a pymatgen change is still worth doing.
   larch's `xftf`; route new transforms through it rather than adding a fourth.
 - χ(R) carries units Å^-(kweight+1), so `kweight` is recorded in the output
   node's `fourier_params` attribute and any axis label must read it back.
+- `radius` is required on `FeffParameters` because it does two jobs: the
+  `RPATH` card and the cluster cutoff that decides which atoms exist. For BCC
+  Fe that is 15 atoms at 4.0 Å against 59 at 5.5. A default for it once drifted
+  from 5.5 to md-exafs' 4.0 while `.radius` still reported 5.5, so a defaulted
+  value is a quiet choice of how big the calculation is. md-exafs offers 4.0
+  and 8.0 as its `quick` and `publication` presets; pick one deliberately.
 
 ## Provenance rules
 
@@ -89,6 +101,12 @@ a generated `feff.inp` across a pymatgen change is still worth doing.
   becomes link label `xas_data__snap_0`. Use
   `workflows.ensemble.dynamic_outputs`; searching for the dotted form silently
   matches nothing.
+- A **required** output that is a dynamic `PortNamespace` with no declared
+  child ports cannot fail a run by being absent: validating the namespace
+  against nothing returns no error, so plumpy's required-output check passes
+  on an empty one. `averaged_xas` is such a port, which is why the workchain
+  has to return `ERROR_NO_ARCHIVE` itself rather than relying on the engine.
+  Any new required dynamic namespace inherits this.
 
 ## `clean_scratch` must stay lossless
 

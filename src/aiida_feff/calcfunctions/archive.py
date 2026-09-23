@@ -62,6 +62,13 @@ def create_serial_shard(**kwargs) -> ExafsArchiveData:
     from md_exafs.hdf5 import BatchShardWriter
     from md_exafs.spectra import resample_chi
 
+    # Only xas__ keys are iterated below, so any other input would enter the
+    # provenance graph and reach no shard.
+    labels = {key.removeprefix("xas__") for key in kwargs if key.startswith("xas__")}
+    assert set(kwargs) <= {f"{p}__{lbl}" for p in ("xas", "paths") for lbl in labels}, sorted(
+        kwargs
+    )
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         out_shard = Path(tmp_dir) / "serial_shard.h5"
         with BatchShardWriter(out_shard, k_grid=DEFAULT_K_GRID) as writer:

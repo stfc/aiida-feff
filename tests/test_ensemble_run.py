@@ -563,6 +563,59 @@ class TestBatchMode:
         assert "archive" in results
         assert results["archive"].is_ensemble
 
+    def test_no_shard_fails_instead_of_finishing_empty(self, aiida_localhost):
+        """Spectra but no shard must be an exit code, not a successful empty run.
+
+        Nothing else catches this.  ``averaged_xas`` is a *required* output,
+        but it is a dynamic namespace with no declared child ports, and
+        validating one of those against an unspecified value returns no error
+        — so plumpy's required-output check is satisfied by the ``n_failed``
+        output alone and the workchain used to finish at exit 0 having
+        produced neither an archive nor a single averaged spectrum.
+
+        The empty ``ctx.shards`` is reached for real when the batch driver
+        swallows an md-exafs ImportError and writes no ``batch_shard.h5``:
+        retrieval ignores the missing file, the batch parser emits no
+        ``archive``, and ``inspect_batch_results`` only reports it.  Driving
+        that end to end would mean breaking an import inside the remote
+        interpreter, so the step is called directly on the state it produces.
+        """
+        from aiida.engine.utils import instantiate_process
+        from aiida.manage import get_manager
+
+        from aiida_feff.data.parameters import FeffParameters
+        from aiida_feff.data.xasdata import XasData
+
+        structure = orm.StructureData(cell=np.eye(3) * 2.87)
+        structure.append_atom(position=(0.0, 0.0, 0.0), symbols="Fe")
+        code = orm.InstalledCode(
+            label="unused-feff", computer=aiida_localhost, filepath_executable="/bin/true"
+        ).store()
+
+        process = instantiate_process(
+            get_manager().get_runner(),
+            EnsembleExafsWorkChain,
+            code=code,
+            structures={"snap_0000": structure.store()},
+            parameters=FeffParameters(dict={"edge": "K", "radius": 5.5, "absorbing_atom": 0}),
+            options=orm.Dict(OPTIONS),
+        )
+
+        xas = XasData()
+        xas.set_chi(np.linspace(0.05, 19.95, 10), np.zeros(10))
+        process.ctx.all_xas = {"snap_0000_site_0000": xas.store()}
+        process.ctx.successful_paths = {}
+        process.ctx.shards = {}
+        process.ctx.n_failed = 0
+        process.ctx.n_total = 1
+
+        exit_code = process.average_results()
+
+        assert exit_code is not None, "no archive, yet the workchain reported success"
+        assert exit_code.status == EnsembleExafsWorkChain.exit_codes.ERROR_NO_ARCHIVE.status
+        assert "archive" not in process.outputs
+        assert not process.outputs.get("averaged_xas", {})
+
     def test_batch_and_serial_paths_agree(self, fake_feff_code, python_code, two_site_trajectory):
         """Batching is a scheduling choice; it must not change the physics."""
         from aiida_feff.data.parameters import FeffParameters

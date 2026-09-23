@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 r"""Batch FEFF driver — runs on the remote compute node, no AiiDA dependency.
 
+Needs md-exafs on that interpreter, and checks for it before running any FEFF.
+The shard it writes is what the ensemble average is built from, so a missing
+md-exafs means the job cannot produce its deliverable; discovering that after
+the batch has run costs the whole allocation.
+
 Written to the job's working directory by
 :class:`~aiida_feff.calculations.feff_batch.FeffBatchCalculation` during
 ``prepare_for_submission`` and executed as the job's main command::
@@ -321,25 +326,24 @@ def main() -> None:
     # md-exafs owns the shard format; we only ran FEFF. Reusing BatchShardWriter
     # and collect_task_into_shard keeps a shard written here byte-compatible with
     # one written by md-exafs' own BatchExecutor.
-    writer = None
-    has_md_exafs = False
-    k_grid = None
-    shard_path = Path("batch_shard.h5")
-
+    #
+    # Checked before the first FEFF starts. The shard is what the ensemble
+    # average is built from, so an interpreter without md-exafs cannot produce
+    # the deliverable, and finding that out after the batch has run costs the
+    # whole allocation.
     try:
         from md_exafs.execution import DEFAULT_K_GRID, BatchShardWriter
+    except ImportError as exc:
+        print(
+            f"ERROR: batch mode requires md-exafs on this interpreter ({sys.executable}), "
+            f"which is the 'python_code' given to FeffBatchCalculation: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
-        has_md_exafs = True
-        k_grid = DEFAULT_K_GRID
-    except ImportError:
-        pass
-
-    if has_md_exafs and k_grid is not None:
-        try:
-            writer = BatchShardWriter(shard_path, k_grid=k_grid, threshold=threshold)
-        except Exception as exc:  # noqa: BLE001
-            print(f"Warning: Failed to initialize BatchShardWriter: {exc}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
+    k_grid = DEFAULT_K_GRID
+    shard_path = Path("batch_shard.h5")
+    writer = BatchShardWriter(shard_path, k_grid=k_grid, threshold=threshold)
 
     successful: list[str] = []
     failed: list[str] = []
@@ -404,16 +408,15 @@ def main() -> None:
                 # --------------------------------------------------------
                 # Step 3: collect into the shard, then reclaim scratch
                 # --------------------------------------------------------
-                if writer is not None:
-                    n_written += collect_chunk(
-                        writer,
-                        chunk_pairs,
-                        chunk_elements,
-                        set(chunk_successful),
-                        k_grid,
-                        threshold,
-                        do_aggregate,
-                    )
+                n_written += collect_chunk(
+                    writer,
+                    chunk_pairs,
+                    chunk_elements,
+                    set(chunk_successful),
+                    k_grid,
+                    threshold,
+                    do_aggregate,
+                )
 
                 # Strip every run in the chunk, successful or not: the files
                 # removed are never retrieved, so a failed run keeps its
@@ -425,34 +428,32 @@ def main() -> None:
                         file=sys.stderr,
                     )
     finally:
-        if writer is not None:
-            try:
-                writer.close()
-            except Exception as exc:  # noqa: BLE001
-                print(f"Warning: Failed to close batch_shard.h5: {exc}", file=sys.stderr)
+        try:
+            writer.close()
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: Failed to close batch_shard.h5: {exc}", file=sys.stderr)
 
     print(
         f"FEFF done: {len(successful)} OK, {len(failed)} failed",
         file=sys.stderr,
     )
 
-    if writer is not None:
+    print(
+        f"SHARD OK  batch_shard.h5 written ({n_written}/{len(successful)} tasks)",
+        file=sys.stderr,
+    )
+    if n_written == 0:
+        shard_path.unlink(missing_ok=True)
         print(
-            f"SHARD OK  batch_shard.h5 written ({n_written}/{len(successful)} tasks)",
+            "Warning: no task produced a parseable chi.dat; batch_shard.h5 not written",
             file=sys.stderr,
         )
-        if n_written == 0:
-            shard_path.unlink(missing_ok=True)
-            print(
-                "Warning: no task produced a parseable chi.dat; batch_shard.h5 not written",
-                file=sys.stderr,
-            )
-        elif n_written < len(successful):
-            print(
-                f"Warning: {len(successful) - n_written} task(s) ran but produced no "
-                "parseable chi.dat and were omitted from batch_shard.h5",
-                file=sys.stderr,
-            )
+    elif n_written < len(successful):
+        print(
+            f"Warning: {len(successful) - n_written} task(s) ran but produced no "
+            "parseable chi.dat and were omitted from batch_shard.h5",
+            file=sys.stderr,
+        )
 
     # Partial failure is normal in an MD ensemble and the parser handles it.
     # A batch where nothing ran is a job failure, and saying so through the

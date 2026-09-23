@@ -18,12 +18,8 @@ from aiida.engine import calcfunction
 from aiida.orm import Dict, SinglefileData
 from md_exafs.experimental import scaled_chi_arrays, shifted_k_mask
 
-from aiida_feff.constants import HBAR2_OVER_2M_EV_ANGSTROM2
 from aiida_feff.data.xasdata import XasData
 from aiida_feff.versions import VERSIONS_ATTR, dependency_versions
-
-#: Deprecated alias kept for callers that imported the old private name.
-_HBAR2_OVER_2M_ELECTRON_EV_ANGSTROM2 = HBAR2_OVER_2M_EV_ANGSTROM2
 
 
 def list_experimental_groups(source: SinglefileData) -> list[str]:

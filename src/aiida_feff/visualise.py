@@ -172,7 +172,17 @@ def plot_chi_r(
 
     # -- resolve r / chir arrays --------------------------------------------
     if isinstance(source, XasData):
-        r, chir_mag, chir_re, chir_im, resolved_ft = _xftf_inline(source, ft_params or {})
+        # No @calcfunction: a plot creates no provenance. The transform itself
+        # is larch.xftf_arrays, the same one chi_k_to_r runs, so a plot and a
+        # stored chi(R) cannot disagree about FT defaults.
+        from aiida_feff.calcfunctions.larch import xftf_arrays
+
+        result = xftf_arrays(source.get_array("k"), source.get_array("chi_k"), ft_params or {})
+        r = result["r"]
+        chir_mag = result["chir_mag"]
+        chir_re = result["chir_re"]
+        chir_im = result["chir_im"]
+        resolved_ft = result["ft_params"]
     elif isinstance(source, ArrayData):
         r = source.get_array("r")
         chir_mag = source.get_array("chir_mag")
@@ -213,21 +223,3 @@ def plot_chi_r(
 # ---------------------------------------------------------------------------
 # Internal: on-the-fly FT without provenance tracking
 # ---------------------------------------------------------------------------
-
-
-def _xftf_inline(xas_data: XasData, ft_params: dict):
-    """Fourier-transform without the @calcfunction wrapper (no AiiDA tracking).
-
-    Delegates to :func:`~aiida_feff.calcfunctions.larch.xftf_arrays` so a plot
-    and the provenance-tracked ``chi_k_to_r`` cannot disagree about FT defaults.
-    """
-    from aiida_feff.calcfunctions.larch import xftf_arrays
-
-    result = xftf_arrays(xas_data.get_array("k"), xas_data.get_array("chi_k"), ft_params)
-    return (
-        result["r"],
-        result["chir_mag"],
-        result["chir_re"],
-        result["chir_im"],
-        result["ft_params"],
-    )

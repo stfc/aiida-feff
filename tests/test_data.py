@@ -8,8 +8,19 @@ from aiida_feff.data.parameters import FeffParameters
 
 class TestFeffParameters:
     def test_valid_minimal(self):
-        p = FeffParameters(dict={"edge": "K"})
+        p = FeffParameters(dict={"edge": "K", "radius": 5.5})
         p.validate()
+
+    def test_missing_radius(self):
+        """radius is required: it decides how big the calculation is.
+
+        The key sets the cluster cutoff as well as the RPATH card, so a default
+        picks the physics.  One did, invisibly: this node reported 5.5 while
+        md-exafs wrote feff.inp at its own 4.0, which for BCC Fe is 59 atoms
+        against 15.
+        """
+        with pytest.raises(ValueError, match="'radius' is required"):
+            FeffParameters(dict={"edge": "K"}).validate()
 
     def test_valid_full(self, generate_feff_parameters):
         p = generate_feff_parameters(spectrum_type="EXAFS", radius=7.0, nleg=6)
@@ -17,7 +28,7 @@ class TestFeffParameters:
 
     def test_invalid_edge(self):
         with pytest.raises(ValueError, match="edge must be one of"):
-            FeffParameters(dict={"edge": "Z99"}).validate()
+            FeffParameters(dict={"edge": "Z99", "radius": 5.5}).validate()
 
     def test_missing_edge(self):
         # Bare `pytest.raises(Exception)` would also pass on an ImportError,
@@ -29,10 +40,10 @@ class TestFeffParameters:
     @pytest.mark.parametrize(
         ("params", "match"),
         [
-            ({"edge": "K", "spectrum_type": "XANES"}, "spectrum_type"),
+            ({"edge": "K", "radius": 5.5, "spectrum_type": "XANES"}, "spectrum_type"),
             ({"edge": "K", "radius": 0.0}, "radius"),
             ({"edge": "K", "radius": -1.0}, "radius"),
-            ({"edge": "K", "s02": -0.1}, "s02"),
+            ({"edge": "K", "radius": 5.5, "s02": -0.1}, "s02"),
         ],
     )
     def test_out_of_range_values_are_rejected(self, params, match):
@@ -56,6 +67,7 @@ class TestFeffParameters:
         p_none = FeffParameters(
             dict={
                 "edge": "K",
+                "radius": 5.5,
                 "scf": None,
             }
         )
@@ -240,7 +252,7 @@ class TestFeffParametersKeyValidation:
 
     def test_unknown_key_rejected(self):
         with pytest.raises(ValueError, match="Unknown FeffParameters key"):
-            FeffParameters(dict={"edge": "K", "not_a_card": 1})
+            FeffParameters(dict={"edge": "K", "radius": 5.5, "not_a_card": 1})
 
     @pytest.mark.parametrize(
         ("wrong", "right"),
@@ -250,7 +262,7 @@ class TestFeffParametersKeyValidation:
         # These two spellings appeared in this repo's own README and examples,
         # where they silently did nothing.
         with pytest.raises(ValueError, match=right):
-            FeffParameters(dict={"edge": "K", wrong: 6.0})
+            FeffParameters(dict={"edge": "K", "radius": 5.5, wrong: 6.0})
 
     def test_every_documented_key_is_accepted(self):
         FeffParameters(
@@ -283,11 +295,11 @@ class TestFeffParametersCards:
         assert any(card.startswith("RPATH") and "6.5" in card for card in cards)
 
     def test_includes_user_cards(self):
-        cards = FeffParameters(dict={"edge": "K", "s02": 0.85}).to_feff_cards()
+        cards = FeffParameters(dict={"edge": "K", "radius": 5.5, "s02": 0.85}).to_feff_cards()
         assert any(card.startswith("S02") and "0.85" in card for card in cards)
 
     def test_deleted_cards_are_shown_as_comments_not_values(self):
-        cards = FeffParameters(dict={"edge": "K", "scf": None}).to_feff_cards()
+        cards = FeffParameters(dict={"edge": "K", "radius": 5.5, "scf": None}).to_feff_cards()
         assert not any(card.startswith("SCF ") for card in cards)
         assert any(card.startswith("*") and "SCF" in card for card in cards)
 

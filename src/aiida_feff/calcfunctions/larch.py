@@ -30,7 +30,6 @@ __all__ = [
     "archive_to_averaged_xas",
     "chi_k_to_r",
     "resolve_ft_params",
-    "tag_averaged_xas",
     "xftf_arrays",
 ]
 
@@ -57,23 +56,6 @@ def archive_to_averaged_xas(archive: ExafsArchiveData) -> dict[str, XasData]:
         site_indices = reader.site_indices
     for site_idx in site_indices:
         out[f"site_{site_idx:04d}"] = archive.to_site_xas_data(site_idx)
-    return out
-
-
-@calcfunction
-def tag_averaged_xas(averaged: XasData, ft_params: Dict) -> XasData:
-    """Copy an averaged XasData and attach Fourier-transform parameters.
-
-    Wrapping the attribute mutation in a calcfunction keeps the provenance
-    graph intact; workflows cannot mutate stored Data nodes directly.
-    """
-    out = XasData()
-    for name in averaged.get_arraynames():
-        out.set_array(name, averaged.get_array(name))
-    for key, val in averaged.base.attributes.all.items():
-        if not key.startswith("array|"):
-            out.base.attributes.set(key, val)
-    out.base.attributes.set("fourier_params", resolve_ft_params(ft_params.get_dict()))
     return out
 
 

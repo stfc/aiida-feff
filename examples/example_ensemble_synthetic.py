@@ -352,10 +352,20 @@ def main(
         )
 
     # ── 6. Collect individual snapshot XasData for overlay ──────────────────
+    # FeffCalculation emits one xas_data node; FeffBatchCalculation emits a
+    # whole namespace of them, one per snap_FFFF_site_SSSS in its chunk. Both
+    # answer to "xas_data" in child.outputs, so the batch route used to append
+    # the namespace itself and fail later inside the plotting helper.
     snapshot_xas = []
     for child in wc_node.called:
-        if child.is_finished_ok and hasattr(child, "outputs") and "xas_data" in child.outputs:
-            snapshot_xas.append(child.outputs.xas_data)
+        if not child.is_finished_ok or "xas_data" not in child.outputs:
+            continue
+        produced = child.outputs.xas_data
+        if hasattr(produced, "get_array"):
+            snapshot_xas.append(produced)
+        else:
+            snapshot_xas.extend(produced[label] for label in sorted(produced))
+    click.echo(f"  {len(snapshot_xas)} snapshot spectra for the overlay")
 
     # ── 7. Per-path χ(k) contributions ──────────────────────────────────────
     # The EXAFS equation itself lives in aiida_feff.calcfunctions.exafs, where

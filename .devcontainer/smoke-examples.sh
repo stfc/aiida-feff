@@ -59,6 +59,7 @@ grep -qE "Fe-Fe +reff=2\.[0-9]+ " serial.log || fail "no Fe-Fe Debye-Waller grou
 # the build or the example silently reports wrong physics.
 ! grep -q "exceeds the maximum safe MIC cutoff" serial.log \
   || fail "Debye-Waller cutoff exceeds the minimum-image limit"
+grep -q "2 snapshot spectra for the overlay" serial.log || fail "serial overlay lost snapshots"
 
 run "example_ensemble_synthetic.py — batch mode"
 uv run --project "$REPO" python "$REPO/examples/example_ensemble_synthetic.py" \
@@ -73,6 +74,11 @@ grep -q "merged from 2 shard(s)" batch.log || fail "expected 2 batch shards"
 # Every k must be backed by all 3 snapshots: a resampling regression that drops
 # the top of the grid shows up here as a min below the max.
 grep -q "contributors per k: min=3 max=3" batch.log || fail "ragged ensemble coverage"
+# FeffBatchCalculation exposes xas_data as a namespace rather than one node,
+# so the overlay has to flatten it. Getting that wrong drops every snapshot
+# curve from the plot, or crashes in the plotting helper.
+grep -q "3 snapshot spectra for the overlay" batch.log || fail "batch overlay lost snapshots"
+[ -s "$WORK/batch.png" ] || fail "batch mode wrote no plot"
 
 run "example_ensemble_synthetic.py — precomputed potentials"
 uv run --project "$REPO" python "$REPO/examples/example_ensemble_synthetic.py" \

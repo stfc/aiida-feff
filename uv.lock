@@ -123,7 +123,7 @@ requires-dist = [
     { name = "coveralls", marker = "extra == 'testing'" },
     { name = "h5py", specifier = ">=3.0" },
     { name = "matplotlib", marker = "extra == 'plots'", specifier = ">=3.6" },
-    { name = "md-exafs", specifier = ">=0.2.0,<0.3" },
+    { name = "md-exafs", specifier = ">=0.3.0,<0.4" },
     { name = "mypy", marker = "extra == 'pre-commit'", specifier = ">=1.10" },
     { name = "numpy", specifier = ">=1.21" },
     { name = "pre-commit", marker = "extra == 'pre-commit'", specifier = ">=3.0" },
@@ -2710,7 +2710,7 @@ wheels = [
 
 [[package]]
 name = "md-exafs"
-version = "0.2.0"
+version = "0.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ase" },
@@ -2724,9 +2724,9 @@ dependencies = [
     { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "xraylarch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f8/36/028811aee020752fb39633a190daced6f05605469f3603f99e1bb6a92dc9/md_exafs-0.2.0.tar.gz", hash = "sha256:0f872fe36e22d5d82941b8c513a02297f26336d9ec4dcf35140032af4282ed6b", size = 156085, upload-time = "2026-09-18T10:08:26.349Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f5/a4/53a74a075711089685d6b7da2cc939dc9efe15bdeb68f61ac1e7c05268f9/md_exafs-0.3.0.tar.gz", hash = "sha256:5cecd518181239d0e798509e7f0801d939ed53240772f81564ace9db65f08b40", size = 166823, upload-time = "2026-09-23T14:10:52.192Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c9/2a/2773ae1cdf8b042fab266fb64a63b31eafceaa1f629eefd6e02f6e726ae3/md_exafs-0.2.0-py3-none-any.whl", hash = "sha256:8c56e23b02346f5c7753a8971477906959788694709159ec3144b2ba791652ce", size = 169336, upload-time = "2026-09-18T10:08:24.707Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/3e/2e543ba9c868368f6f98ee6bfadf615bec7085e0b15e11afd97fa9de4dfa/md_exafs-0.3.0-py3-none-any.whl", hash = "sha256:cec1de4d2e67bd9a0f2179627ea9380c341322df395f434177026ee688aef057", size = 180439, upload-time = "2026-09-23T14:10:50.806Z" },
 ]
 
 [[package]]

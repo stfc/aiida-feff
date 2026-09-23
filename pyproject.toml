@@ -33,7 +33,7 @@ dependencies = [
     # minor release there changes this package's numerical output. The cap
     # forces the bump to be a deliberate PR that runs the larch oracle tests
     # before users see it.
-    "md-exafs>=0.2.0,<0.3",
+    "md-exafs>=0.3.0,<0.4",
 ]
 
 [project.optional-dependencies]

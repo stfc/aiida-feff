@@ -545,13 +545,13 @@ class TestBatchMode:
         tol = 1e-4 * np.abs(expected).max()
         np.testing.assert_allclose(archive.chi, expected, rtol=0.0, atol=tol)
 
-        # Note: this is deliberately *not* compared against averaged_xas.  That
-        # output comes from larch's autobk on xmu.dat, whereas the archive comes
-        # from FEFF's own chi.dat; the two agree on real data but not on a
-        # synthetic mu(E).
+        # averaged_xas is derived directly from the archive, so they agree bit-for-bit.
+        np.testing.assert_array_equal(
+            results["averaged_xas"]["all"].get_array("chi_k"), archive.chi
+        )
 
-    def test_serial_path_reports_no_archive(self, fake_feff_code, two_site_trajectory):
-        """FeffCalculation writes no shard, so the serial path must not claim one."""
+    def test_serial_path_produces_archive(self, fake_feff_code, two_site_trajectory):
+        """Serial path writes a shard via BatchShardWriter, so archive always exists."""
         from aiida_feff.data.parameters import FeffParameters
 
         results, node = run_workchain(
@@ -560,14 +560,16 @@ class TestBatchMode:
             parameters=FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atom": 0}),
         )
         assert node.is_finished_ok, node.exit_message
-        assert "archive" not in results
+        assert "archive" in results
+        assert results["archive"].is_ensemble
 
     def test_batch_and_serial_paths_agree(self, fake_feff_code, python_code, two_site_trajectory):
         """Batching is a scheduling choice; it must not change the physics."""
         from aiida_feff.data.parameters import FeffParameters
 
-        def average(**extra):
+        def run(batch_mode: bool):
             params = FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atom": 0})
+            extra = {"python_code": python_code, "batch_size": orm.Int(3)} if batch_mode else {}
             results, node = run_workchain(
                 code=fake_feff_code,
                 trajectory=two_site_trajectory,
@@ -575,27 +577,22 @@ class TestBatchMode:
                 **extra,
             )
             assert node.is_finished_ok, node.exit_message
-            return results["averaged_xas"]["all"]
+            return results
 
-        serial = average()
-        batched = average(python_code=python_code, batch_size=orm.Int(3))
+        serial_results = run(batch_mode=False)
+        batched_results = run(batch_mode=True)
 
-        serial_chi = serial.get_array("chi_k")
-        batched_chi = batched.get_array("chi_k")
+        serial_archive = serial_results["archive"]
+        batched_archive = batched_results["archive"]
 
-        # Guard: the comparison is only meaningful if the snapshots being
-        # averaged actually differ from one another. With the old constant
-        # stand-in both sides averaged copies of a single array, so this
-        # assertion held for any implementation -- including one that
-        # dropped every snapshot but the first.
-        assert serial.base.attributes.get("n_snapshots") == 3
-        assert np.abs(serial_chi).max() > 0
-        assert serial.get_array("chi_k_std").max() > 0, (
-            "snapshots are identical -- this test cannot distinguish a correct "
-            "average from one that discarded all but one snapshot"
-        )
+        # Bit-for-bit comparison of two archives (Handoff Phase 2)
+        np.testing.assert_array_equal(serial_archive.chi, batched_archive.chi)
+        np.testing.assert_array_equal(serial_archive.k, batched_archive.k)
 
-        np.testing.assert_allclose(batched_chi, serial_chi, rtol=1e-10)
+        serial_xas = serial_results["averaged_xas"]["all"]
+        batched_xas = batched_results["averaged_xas"]["all"]
+        np.testing.assert_array_equal(serial_xas.get_array("chi_k"), batched_xas.get_array("chi_k"))
+        np.testing.assert_array_equal(serial_xas.get_array("k"), batched_xas.get_array("k"))
 
     def test_clean_scratch_does_not_change_the_spectrum(
         self, fake_feff_code, python_code, two_site_trajectory
@@ -603,9 +600,7 @@ class TestBatchMode:
         """clean_scratch reclaims disk only; every parsed array must be bit-identical.
 
         Asserting n_snapshots or the node type would pass even if the averaged
-        spectrum silently changed grid, amplitude or provenance -- which is
-        exactly what happens if the parser is allowed to fall back to the
-        shard's zero-filled, mu-free chi(k). Compare the arrays instead.
+        spectrum silently changed grid, amplitude or provenance. Compare the arrays instead.
         """
         from aiida_feff.data.parameters import FeffParameters
 
@@ -625,11 +620,10 @@ class TestBatchMode:
         clean = average(clean_scratch=orm.Bool(True), stream_chunk_size=orm.Int(1))
         dirty = average(clean_scratch=orm.Bool(False))
 
-        # mu(E) and e0 survive stripping: the shard stores chi only, so their
-        # loss is the first symptom of the parser reading the wrong source.
         assert set(clean.get_arraynames()) == set(dirty.get_arraynames())
-        assert {"energy", "mu", "chi_k", "k"} <= set(clean.get_arraynames())
-        assert clean.e0 == dirty.e0
+        assert {"chi_k", "k"} <= set(clean.get_arraynames())
+        assert "energy" not in clean.get_arraynames()
+        assert "mu" not in clean.get_arraynames()
 
         for name in sorted(dirty.get_arraynames()):
             np.testing.assert_array_equal(
@@ -647,3 +641,70 @@ class TestBatchMode:
         )
         expected = EnsembleExafsWorkChain.exit_codes.ERROR_MISSING_AGGREGATION_CODE
         assert node.exit_status == expected.status
+
+
+# The default stand-in writes chi.dat on exactly the grid the archive uses, so
+# the round trip is exact and every assertion above can use array equality.
+# Real FEFF does not oblige: the grid runs to whatever the EXAFS card asks for,
+# and starts at k=0 or k=0.05 depending on the run, giving 400 or 401 rows.
+# This variant reproduces both departures at once -- a short spectrum on the
+# offset grid -- because that combination used to produce an all-NaN chi(R).
+_SHORT_CHI_FROM = "for i in range(1, 401):"
+_SHORT_CHI_TO = "for i in range(0, 281):"
+assert _SHORT_CHI_FROM in FAKE_FEFF, "stand-in chi.dat loop moved; SHORT_CHI_FEFF is a no-op"
+SHORT_CHI_FEFF = FAKE_FEFF.replace(_SHORT_CHI_FROM, _SHORT_CHI_TO)
+
+
+@pytest.fixture()
+def short_chi_feff_code(tmp_path_factory, aiida_localhost):
+    """Stand-in whose chi.dat stops at k = 14, as `EXAFS 14` would."""
+    script = tmp_path_factory.mktemp("shortfeff") / "feff.sh"
+    script.write_text(SHORT_CHI_FEFF)
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return orm.InstalledCode(
+        label="short-chi-feff", computer=aiida_localhost, filepath_executable=str(script)
+    ).store()
+
+
+@pytest.mark.usefixtures("aiida_profile_clean")
+class TestShortChiDat:
+    """A chi.dat shorter than the archive grid must not blank the transform."""
+
+    def test_short_chi_dat_still_gives_a_finite_chi_r(
+        self, short_chi_feff_code, two_site_trajectory
+    ):
+        from aiida_feff.data.parameters import FeffParameters
+
+        results, node = run_workchain(
+            code=short_chi_feff_code,
+            trajectory=two_site_trajectory,
+            parameters=FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atom": 0}),
+        )
+        assert node.is_finished_ok, node.exit_message
+
+        archive = results["archive"]
+        # chi(R) is what a NaN anywhere on the k grid used to destroy: the
+        # window multiplies the whole array and 0 * nan is nan.
+        assert np.isfinite(archive.chir_mag).all()
+        assert archive.chir_mag.max() > 0.0
+
+        k = archive.k
+        chi = archive.chi
+        # chi(k) still says honestly where the ensemble ran out of data,
+        # rather than reporting a zero that would read as a real datum.
+        assert np.isfinite(chi[k <= 14.0]).all()
+        assert np.isnan(chi[k > 14.0]).all()
+
+        counts = results["averaged_xas"]["all"].get_array("chi_k_count")
+        assert (counts[k <= 14.0] == 3).all()
+        assert (counts[k > 14.0] == 0).all()
+
+    def test_offset_grid_alone_loses_no_data(self, short_chi_feff_code, two_site_trajectory):
+        """The 400-row grid ends at 19.95, the archive grid's last point.
+
+        np.arange(0.05, 20.0, 0.05) overshoots it by 3.6e-15, which used to
+        resample to NaN and take the whole transform with it.
+        """
+        from md_exafs.execution import DEFAULT_K_GRID
+
+        assert DEFAULT_K_GRID[-1] == 19.95

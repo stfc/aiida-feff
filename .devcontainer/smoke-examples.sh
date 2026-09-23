@@ -46,9 +46,10 @@ uv run --project "$REPO" python "$REPO/examples/example_ensemble_synthetic.py" \
   --plot-file "$WORK/serial.png" 2>&1 | tee serial.log
 grep -q "path_contributions pk=" serial.log || fail "--store-paths produced no path_contributions"
 [ -s "$WORK/serial.png" ] || fail "no plot was written"
-# The serial route writes no batch shards, so it must report no archive rather
-# than leaving the output silently absent.
-grep -q "archive pk=" serial.log && fail "serial route reported an archive"
+# Both routes end at merge_exafs_shards, so the archive exists either way.
+grep -q "archive pk=" serial.log || fail "serial route produced no archive"
+grep -q "ensemble=True" serial.log || fail "serial archive is not an ensemble archive"
+grep -q "merged from 1 shard(s)" serial.log || fail "serial route wrote no shard"
 
 run "example_ensemble_synthetic.py — batch mode"
 uv run --project "$REPO" python "$REPO/examples/example_ensemble_synthetic.py" \
@@ -59,7 +60,10 @@ grep -q "batch mode: chunks of 2" batch.log || fail "batch mode was not engaged"
 grep -q "archive pk=" batch.log || fail "batch mode produced no consolidated archive"
 grep -q "ensemble=True" batch.log || fail "the archive is not an ensemble archive"
 # 3 snapshots in chunks of 2 is 2 scheduler jobs, which is the point of batching.
-grep -q "merged from 2 batch shard(s)" batch.log || fail "expected 2 batch shards"
+grep -q "merged from 2 shard(s)" batch.log || fail "expected 2 batch shards"
+# Every k must be backed by all 3 snapshots: a resampling regression that drops
+# the top of the grid shows up here as a min below the max.
+grep -q "contributors per k: min=3 max=3" batch.log || fail "ragged ensemble coverage"
 
 run "example_ensemble_synthetic.py — precomputed potentials"
 uv run --project "$REPO" python "$REPO/examples/example_ensemble_synthetic.py" \

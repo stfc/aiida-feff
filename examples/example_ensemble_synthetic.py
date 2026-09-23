@@ -22,6 +22,7 @@ from __future__ import annotations
 import click
 import numpy as np
 from aiida import load_profile, orm
+from aiida.common.links import LinkType
 from aiida.engine import run_get_node
 
 # ---------------------------------------------------------------------------
@@ -278,26 +279,27 @@ def main(
         f"({n_snapshots - n_failed}/{n_snapshots} snapshots succeeded)"
     )
 
-    averaged_xas = wc_node.outputs.averaged_xas
+    averaged_xas = wc_node.outputs.averaged_xas.all
+    counts = averaged_xas.get_array("chi_k_count")
     click.echo(
         f"  averaged_xas pk={averaged_xas.pk}  "
         f"k-grid: {averaged_xas.get_array('k').shape}  "
-        f"n_snapshots={averaged_xas.base.extras.get('n_snapshots')}"
+        f"n_snapshots={averaged_xas.base.attributes.get('n_snapshots')}"
     )
+    # Coverage is per-k, not a single number: a snapshot whose chi.dat stopped
+    # early drops out above its own k_max.
+    click.echo(f"    contributors per k: min={int(counts.min())} max={int(counts.max())}")
 
-    # The consolidated ensemble archive (ADR 0004). Only the batch path writes
-    # shards, so the serial route legitimately has no archive and says so
-    # rather than leaving the output silently absent.
-    archive = getattr(wc_node.outputs, "archive", None)
-    if archive is not None:
-        click.echo(
-            f"  archive pk={archive.pk}  ensemble={archive.is_ensemble}  "
-            f"k-grid: {archive.k.shape}  r-grid: {archive.r.shape}"
-        )
-        shards = [c for c in wc_node.called if c.label.startswith("batch_")]
-        click.echo(f"    merged from {len(shards)} batch shard(s)")
-    elif batch_size:
-        click.echo("  archive: MISSING despite batch mode", err=True)
+    # The consolidated ensemble archive (ADR 0004), written on both routes.
+    archive = wc_node.outputs.archive
+    click.echo(
+        f"  archive pk={archive.pk}  ensemble={archive.is_ensemble}  "
+        f"k-grid: {archive.k.shape}  r-grid: {archive.r.shape}"
+    )
+    # Counted from the merge calcfunction's own inputs rather than guessed
+    # from child labels, so this cannot drift from what was actually merged.
+    n_shards = len(archive.creator.base.links.get_incoming(link_type=LinkType.INPUT_CALC).all())
+    click.echo(f"    merged from {n_shards} shard(s)")
 
     # Grab merged path contributions node (present when --store-paths is enabled).
     path_contrib = getattr(wc_node.outputs, "path_contributions", None)

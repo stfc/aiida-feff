@@ -222,7 +222,7 @@ class TestDriverExitStatus:
         scratch; xmu.dat / chi.dat / log.dat are what the parser reads. Deleting
         the latter would change parsed physics, so assert both halves.
         """
-        keep = ["chi.dat", "files.dat", "log.dat", "paths.dat", "stderr.txt", "xmu.dat"]
+        keep = ["chi.dat", "files.dat", "log.dat", "paths.dat", "stderr.txt"]
         res = self._run_driver(
             tmp_path, clean_scratch=True, stream_chunk_size=1, scratch_keep_files=keep
         )
@@ -233,7 +233,6 @@ class TestDriverExitStatus:
             snap = tmp_path / label
             assert snap.is_dir(), "stripping must not remove the run directory itself"
             assert (snap / "chi.dat").exists()
-            assert (snap / "xmu.dat").exists()
             assert (snap / "log.dat").exists()
             assert not list(snap.glob("feff[0-9]*.dat")), "path files should be reclaimed"
             assert not (snap / "phase.pad").exists()
@@ -262,7 +261,7 @@ class TestDriverExitStatus:
         """Stripping is lossless, so the shard contents must not depend on it."""
         import h5py
 
-        keep = ["chi.dat", "files.dat", "log.dat", "paths.dat", "stderr.txt", "xmu.dat"]
+        keep = ["chi.dat", "files.dat", "log.dat", "paths.dat", "stderr.txt"]
 
         def chis(clean):
             d = tmp_path_factory.mktemp(f"clean_{clean}")
@@ -470,20 +469,20 @@ class TestBatchParser:
             namespaced.setdefault(namespace, {})[key] = out_node
         return namespaced, (exit_code.status if exit_code else 0)
 
-    XMU = (
-        "# Feff8L (EXAFS)  0.1\n"
-        "#  omega    e    k    mu      mu0     chi\n"
+    CHI = (
+        "# FEFF chi.dat\n"
+        "#  k         chi(k)    |chi|     phase\n"
         + "\n".join(
-            f"{e:8.3f} {e:8.3f} {abs(e) ** 0.5:8.3f} {1.0:8.3f} {0.9:8.3f} {0.1:8.3f}"
-            for e in np.linspace(0.0, 200.0, 60)
+            f"{k:8.3f} {np.sin(k) * 0.1:12.6f} 0.000000 0.000000"
+            for k in np.linspace(0.05, 15.0, 60)
         )
         + "\n"
     )
 
     def test_one_output_per_successful_run(self, aiida_profile_clean):
         retrieved = {
-            f"{_snap_label(0, 0)}/xmu.dat": self.XMU,
-            f"{_snap_label(1, 0)}/xmu.dat": self.XMU,
+            f"{_snap_label(0, 0)}/chi.dat": self.CHI,
+            f"{_snap_label(1, 0)}/chi.dat": self.CHI,
         }
         outputs, status = self._parse(retrieved, aiida_profile_clean)
         assert status == 0
@@ -491,7 +490,7 @@ class TestBatchParser:
 
     def test_missing_run_is_skipped_not_fatal(self, aiida_profile_clean):
         retrieved = {
-            f"{_snap_label(0, 0)}/xmu.dat": self.XMU,
+            f"{_snap_label(0, 0)}/chi.dat": self.CHI,
             f"{_snap_label(1, 0)}/stderr.txt": "FEFF crashed",
         }
         outputs, status = self._parse(retrieved, aiida_profile_clean)
@@ -504,7 +503,7 @@ class TestBatchParser:
 
     def test_feff_version_is_recorded(self, aiida_profile_clean):
         retrieved = {
-            f"{_snap_label(0, 0)}/xmu.dat": self.XMU,
+            f"{_snap_label(0, 0)}/chi.dat": self.CHI,
             f"{_snap_label(0, 0)}/log.dat": "  Feff 8.50L\n  more banner\n",
         }
         outputs, status = self._parse(retrieved, aiida_profile_clean)

@@ -15,13 +15,20 @@ Workflow
 5. Launch one :class:`~aiida_feff.calculations.feff.FeffCalculation` per
    ``(frame, site)`` pair (fan-out: N_frames x N_sites jobs).
 6. Wait for all children to finish.
-7. Call :func:`~aiida_feff.calcfunctions.larch.average_xas_data` to
-   produce per-site and overall ensemble-averaged
-   :class:`~aiida_feff.data.xasdata.XasData` outputs.
+7. Consolidate every χ(k) into one :class:`~aiida_feff.data.archive.ExafsArchiveData`
+   with :func:`~aiida_feff.calcfunctions.archive.merge_exafs_shards`, then
+   project the averages it holds into ``averaged_xas`` with
+   :func:`~aiida_feff.calcfunctions.larch.archive_to_averaged_xas`.
+
+The batch route gets its shards from the remote driver and the serial route
+builds one with :func:`~aiida_feff.calcfunctions.archive.create_serial_shard`,
+so both end at the same merge and the ensemble average has a single
+implementation (ADR 0004).
 
 Multi-site outputs
 ------------------
-``averaged_xas.site_NNNN``  per-site average (one per absorber site index)
+``archive``                 consolidated ensemble HDF5; the node to read
+``averaged_xas.site_NNNN``  per-site average, projected from ``archive``
 ``averaged_xas.all``        grand average over all sites and all frames
 ``path_contributions``      merged HDF5; filter by ``site_idx`` column post-hoc
 
@@ -41,8 +48,8 @@ from aiida import orm
 from aiida.engine import ToContext, WorkChain, if_
 from aiida.engine.processes.ports import PORT_NAMESPACE_SEPARATOR
 
-from aiida_feff.calcfunctions.archive import merge_exafs_shards
-from aiida_feff.calcfunctions.larch import average_xas_data
+from aiida_feff.calcfunctions.archive import create_serial_shard, merge_exafs_shards
+from aiida_feff.calcfunctions.larch import archive_to_averaged_xas
 from aiida_feff.calcfunctions.path_contributions import merge_path_contributions
 from aiida_feff.calculations.feff import CONTROL_NO_POT, CONTROL_POT_ONLY, FeffCalculation
 from aiida_feff.calculations.feff_batch import FeffBatchCalculation, _snap_label
@@ -383,8 +390,7 @@ class EnsembleExafsWorkChain(WorkChain):
             valid_type=orm.Bool,
             default=lambda: orm.Bool(False),
             help=(
-                "When using batch mode, delete successful snapshot scratch "
-                "directories on the fly."
+                "When using batch mode, delete successful snapshot scratch directories on the fly."
             ),
         )
         spec.input(
@@ -585,7 +591,7 @@ class EnsembleExafsWorkChain(WorkChain):
         """Check each potentials run and build ctx.pot_remote[site_idx → RemoteData].
 
         The parser recognises a potentials-only CONTROL card and returns 0 when
-        ``xmu.dat`` is legitimately absent, so only exit status 0 is accepted
+        ``chi.dat`` is legitimately absent, so only exit status 0 is accepted
         here.
 
         Potentials are precomputed per absorber site and are independent of one another.
@@ -851,9 +857,26 @@ class EnsembleExafsWorkChain(WorkChain):
         self.ctx.all_xas = all_xas
         self.ctx.successful_paths = successful_paths
         self.ctx.n_failed = n_failed + getattr(self.ctx, "n_failed_precompute", 0)
-        # FeffCalculation writes no batch_shard.h5, so the consolidated 'archive'
-        # output is only produced on the batch path.
-        self.ctx.shards = {}
+
+        # Serial path writes a shard via BatchShardWriter so merge_shards runs
+        # on both paths and the archive always exists (Decision 4 / ADR 0004).
+        if all_xas:
+            shard_inputs: dict[str, t.Any] = {}
+            for label, xas_node in all_xas.items():
+                shard_inputs[f"xas__{label}"] = xas_node
+            for label, pc_node in successful_paths.items():
+                shard_inputs[f"paths__{label}"] = pc_node
+
+            serial_shard = create_serial_shard(
+                metadata={
+                    "call_link_label": "create_serial_shard",
+                    "label": "serial_batch_shard",
+                },
+                **shard_inputs,
+            )
+            self.ctx.shards = {"serial_shard": serial_shard}
+        else:
+            self.ctx.shards = {}
 
     def average_results(self) -> None:
         """Produce per-site and grand-average XasData outputs."""
@@ -866,26 +889,6 @@ class EnsembleExafsWorkChain(WorkChain):
             self.report("All snapshot calculations failed.")
             return self.exit_codes.ERROR_ALL_FAILED  # type: ignore[no-any-return]
 
-        # Per-site averages
-        for site_idx, xas_dict in self.ctx.per_site_xas.items():
-            if not xas_dict:
-                continue
-            averaged = average_xas_data(
-                metadata={
-                    "call_link_label": f"average_xas_site_{site_idx:04d}",
-                    "label": f"ensemble_average_site_{site_idx:04d}",
-                },
-                **xas_dict,
-            )
-            self.out(f"averaged_xas.site_{site_idx:04d}", averaged)
-
-        # Grand average over all sites and frames
-        grand_avg = average_xas_data(
-            metadata={"call_link_label": "average_xas_all", "label": "ensemble_average_all"},
-            **self.ctx.all_xas,
-        )
-        self.out("averaged_xas.all", grand_avg)
-
         self.out("n_failed", orm.Int(n_failed).store())
 
         if self.inputs.path_cw_threshold.value >= 0 and self.ctx.successful_paths:
@@ -896,9 +899,8 @@ class EnsembleExafsWorkChain(WorkChain):
             )
             self.out("path_contributions", merged)
 
-        # Consolidate the per-batch shards into one ensemble archive (ADR 0004).
-        # This is the node downstream tooling reads; the XasData / PathContributions
-        # outputs above are kept for backwards compatibility.
+        # Consolidate shards into one ensemble archive (ADR 0004).
+        # Written on both batch and serial paths.
         if self.ctx.shards:
             ensemble_archive = merge_exafs_shards(
                 metadata={
@@ -908,11 +910,22 @@ class EnsembleExafsWorkChain(WorkChain):
                 **self.ctx.shards,
             )
             self.out("archive", ensemble_archive)
-        else:
-            self.report(
-                "No batch shards available; the 'archive' output was not produced. "
-                "Consolidated archives are only written by the batch execution path."
+
+            # The averaged_xas outputs are a projection of the archive, not a
+            # second average over the per-snapshot nodes, so there is one
+            # ensemble average in the graph and one place it can be wrong.
+            averaged_nodes = archive_to_averaged_xas(
+                ensemble_archive,
+                # AiiDA injects metadata into every calcfunction; the signature
+                # stays narrow so a stray keyword cannot become a silent,
+                # ignored provenance input.
+                metadata={  # type: ignore[call-arg]
+                    "call_link_label": "project_averaged_xas",
+                    "label": "projected_averaged_xas",
+                },
             )
+            for key, xas_node in averaged_nodes.items():
+                self.out(f"averaged_xas.{key}", xas_node)
 
         if "group_label" in self.inputs:
             label = self.inputs.group_label.value

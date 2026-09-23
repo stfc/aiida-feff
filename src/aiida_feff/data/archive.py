@@ -126,15 +126,59 @@ class ExafsArchiveData(SinglefileData):
         return ArchiveReader(self._cached_path()).get_frame_average(frame_idx)
 
     def to_xas_data(self) -> XasData:
-        """Convert the overall average to a legacy XasData node for backwards compatibility."""
-        from aiida_feff.data.xasdata import XasData
-
+        """Project the grand average onto an unstored XasData node."""
         with self.reader() as archive:
-            k, chi = archive.k, archive.chi
+            return _as_xas_data(
+                archive.k,
+                archive.chi,
+                n_contributors=archive.n_contributors,
+                chi_std=archive.chi_std,
+            )
 
-        out = XasData()
-        out.set_chi(k, chi)
+    def to_site_xas_data(self, site_idx: int) -> XasData:
+        """Project one absorber site's average onto an unstored XasData node."""
+        site = self.get_site_average(site_idx)
+        out = _as_xas_data(
+            site["k"],
+            site["chi"],
+            n_contributors=site.get("n_contributors"),
+        )
+        out.base.attributes.set("site_index", int(site_idx))
         return out
+
+
+def _as_xas_data(
+    k: np.ndarray,
+    chi: np.ndarray,
+    *,
+    n_contributors: np.ndarray | None,
+    chi_std: np.ndarray | None = None,
+) -> XasData:
+    """Wrap archive arrays in an XasData node, carrying the coverage with them.
+
+    ``chi_k_count`` is the number of snapshots contributing at each k, and it
+    is not flat: a snapshot whose ``chi.dat`` stopped early drops out above its
+    own k_max, leaving χ(k) NaN wherever nothing contributed at all.  Anything
+    reading this node needs the count to know which part of the spectrum is
+    backed by the full ensemble.
+    """
+    from aiida_feff.data.xasdata import XasData
+    from aiida_feff.versions import VERSIONS_ATTR, dependency_versions
+
+    out = XasData()
+    out.set_chi(k, chi)
+    if chi_std is not None:
+        out.set_array("chi_k_std", chi_std)
+    if n_contributors is not None:
+        out.set_array("chi_k_count", n_contributors.astype(float))
+        # The ensemble size, not the per-k coverage: every snapshot that
+        # contributed anywhere.  np.max is that count because a snapshot
+        # contributes over a contiguous run of k starting at the bottom of
+        # the grid, so the widest coverage is reached by all of them.
+        out.base.attributes.set("n_snapshots", int(np.max(n_contributors)))
+    out.base.attributes.set("chi_source", "feff.chi.dat")
+    out.base.attributes.set(VERSIONS_ATTR, dependency_versions())
+    return out
 
 
 __all__ = [

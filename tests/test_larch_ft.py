@@ -8,12 +8,12 @@ from aiida.orm import Dict
 
 from aiida_feff.calcfunctions.larch import (
     FT_DEFAULTS,
-    _average_xas_data_impl,
+    archive_to_averaged_xas,
     chi_k_to_r,
     resolve_ft_params,
     xftf_arrays,
 )
-from aiida_feff.data.xasdata import XasData
+from aiida_feff.data.archive import ExafsArchiveData
 
 pytest.importorskip("larch.xafs")
 
@@ -137,80 +137,44 @@ class TestFtParameterHandling:
         assert mag.max() > 0.0
 
 
-class TestEnsembleAveraging:
-    """Averaging must not depend on dict order or on members' k ranges."""
+class TestArchiveProjection:
+    """archive_to_averaged_xas must project ExafsArchiveData into bit-identical XasData nodes."""
 
-    @staticmethod
-    def make_node(k, chi, energy=None, mu=None, e0=7112.0):
-        node = XasData()
-        energy = np.linspace(-20, 200, 50) if energy is None else energy
-        mu = np.ones_like(energy) if mu is None else mu
-        node.set_spectrum(energy, mu, e0=e0)
-        node.set_chi(k, chi)
-        return node
+    def test_archive_projection_is_bit_identical(self, tmp_path, aiida_profile):
+        from md_exafs.hdf5 import EnsembleWriter
 
-    def test_average_of_identical_is_identity(self, aiida_profile):
-        k = np.linspace(0, 15, 100)
-        chi = np.sin(2 * k * 2.5)
-        nodes = {f"snap_{i:04d}": self.make_node(k, chi) for i in range(4)}
-        out = _average_xas_data_impl(**nodes)
-        np.testing.assert_allclose(out.get_array("chi_k"), chi)
-        np.testing.assert_allclose(out.get_array("chi_k_std"), 0.0, atol=1e-12)
+        h5_path = tmp_path / "ensemble.h5"
+        k = np.linspace(0.05, 15.0, 100)
+        chi_overall = np.sin(2 * k * 2.5)
+        chi_std = np.full_like(k, 0.05)
+        n_contrib = np.full(len(k), 4, dtype=np.int32)
 
-    def test_result_is_independent_of_key_order(self, aiida_profile):
-        k = np.linspace(0, 15, 100)
-        nodes = {
-            "snap_0000": self.make_node(k, np.sin(2 * k * 2.0)),
-            "snap_0001": self.make_node(k, np.sin(2 * k * 2.6)),
-        }
-        forward = _average_xas_data_impl(**nodes)
-        reversed_order = _average_xas_data_impl(**dict(reversed(list(nodes.items()))))
-        np.testing.assert_allclose(forward.get_array("chi_k"), reversed_order.get_array("chi_k"))
+        chi_site1 = np.cos(1.8 * k)
+        n_contrib_site1 = np.full(len(k), 2, dtype=np.int32)
 
-    def test_short_member_does_not_drag_the_mean_to_zero(self, aiida_profile):
-        """Zero-filling past a member's kmax would bias exactly where sigma2 lives."""
-        k_long = np.linspace(0, 15, 151)
-        k_short = np.linspace(0, 8, 81)
-        value = 0.4
-        nodes = {
-            "snap_0000": self.make_node(k_long, np.full_like(k_long, value)),
-            "snap_0001": self.make_node(k_short, np.full_like(k_short, value)),
-        }
-        out = _average_xas_data_impl(**nodes)
-        chi = out.get_array("chi_k")
-        high_k = out.get_array("k") > 10.0
-        np.testing.assert_allclose(chi[high_k], value, rtol=1e-12)
-        # And the node says how many members backed each point, with the
-        # spread left undefined where only one did.
-        counts = out.get_array("chi_k_count")
-        assert counts[high_k].max() == 1
-        assert counts[out.get_array("k") < 8.0].min() == 2
-        assert np.all(np.isnan(out.get_array("chi_k_std")[high_k]))
+        with EnsembleWriter(h5_path, k_grid=k) as writer:
+            writer.set_overall_average(k, chi_overall, chi_std=chi_std, n_contributors=n_contrib)
+            writer.add_site_average(site_idx=1, k=k, chi=chi_site1, n_contributors=n_contrib_site1)
 
-    def test_first_node_without_chi_is_tolerated(self, aiida_profile):
-        k = np.linspace(0, 15, 100)
-        chi = np.sin(2 * k * 2.5)
-        without_chi = XasData()
-        without_chi.set_spectrum(np.linspace(-20, 200, 50), np.ones(50))
-        out = _average_xas_data_impl(snap_0000=without_chi, snap_0001=self.make_node(k, chi))
-        np.testing.assert_allclose(out.get_array("chi_k"), chi)
-        assert out.base.attributes.get("n_snapshots") == 2
-        assert out.base.attributes.get("n_snapshots_chi") == 1
+        archive = ExafsArchiveData(file=str(h5_path))
+        projected = archive_to_averaged_xas(archive)
 
-    def test_e0_survives_averaging(self, aiida_profile):
-        k = np.linspace(0, 15, 50)
-        nodes = {f"snap_{i:04d}": self.make_node(k, np.sin(k), e0=7112.0) for i in range(3)}
-        assert _average_xas_data_impl(**nodes).e0 == pytest.approx(7112.0)
+        assert "all" in projected
+        assert "site_0001" in projected
 
-    def test_std_is_the_sample_estimator(self, aiida_profile):
-        k = np.linspace(0, 15, 20)
-        values = [0.1, 0.2, 0.6]
-        nodes = {
-            f"snap_{i:04d}": self.make_node(k, np.full_like(k, v)) for i, v in enumerate(values)
-        }
-        out = _average_xas_data_impl(**nodes)
-        np.testing.assert_allclose(out.get_array("chi_k_std"), np.std(values, ddof=1), rtol=1e-12)
+        xas_all = projected["all"]
+        # Bit-identical checks (decision 5)
+        np.testing.assert_array_equal(xas_all.get_array("chi_k"), chi_overall)
+        np.testing.assert_array_equal(xas_all.get_array("k"), k)
+        np.testing.assert_array_equal(xas_all.get_array("chi_k_std"), chi_std)
+        np.testing.assert_array_equal(xas_all.get_array("chi_k_count"), n_contrib.astype(float))
+        assert xas_all.base.attributes.get("chi_source") == "feff.chi.dat"
+        assert xas_all.base.attributes.get("n_snapshots") == 4
 
-    def test_empty_input_raises(self, aiida_profile):
-        with pytest.raises(ValueError, match="No XasData nodes"):
-            _average_xas_data_impl()
+        xas_site1 = projected["site_0001"]
+        np.testing.assert_array_equal(xas_site1.get_array("chi_k"), chi_site1)
+        np.testing.assert_array_equal(xas_site1.get_array("k"), k)
+        np.testing.assert_array_equal(
+            xas_site1.get_array("chi_k_count"), n_contrib_site1.astype(float)
+        )
+        assert xas_site1.base.attributes.get("site_index") == 1

@@ -34,17 +34,18 @@ class TestFeffCalculationPrepare:
         )
         assert fixture_sandbox.isfile(FEFF_INPUT_FILE)
 
-    def test_retrieve_list_contains_xmuda(
+    def test_retrieve_list_contains_chi_not_xmu(
         self, generate_calc_job, feff_calc_inputs, fixture_sandbox
     ):
-        from aiida_feff.calculations.feff import FEFF_XMUDA_FILE
+        from aiida_feff.calculations.feff import FEFF_CHI_FILE, FEFF_XMUDA_FILE
 
         calc_info = generate_calc_job(
             folder=fixture_sandbox,
             entry_point_name="feff.feff",
             inputs=feff_calc_inputs,
         )
-        assert FEFF_XMUDA_FILE in calc_info.retrieve_list
+        assert FEFF_CHI_FILE in calc_info.retrieve_list
+        assert FEFF_XMUDA_FILE not in calc_info.retrieve_list
 
     def test_feff_inp_contains_edge(self, generate_calc_job, feff_calc_inputs, fixture_sandbox):
         from aiida_feff.calculations.feff import FEFF_INPUT_FILE

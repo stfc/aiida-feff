@@ -38,7 +38,6 @@ from aiida_feff.calculations.feff import (
     FEFF_FILES_DAT,
     FEFF_PATHS_FILE,
     FEFF_POTENTIAL_FILES,
-    FEFF_XMUDA_FILE,
     FeffCalculation,
     absorber_element,
     as_lf_bytes,
@@ -61,7 +60,6 @@ BATCH_ERR = "batch_err.log"
 # Retrieve glob patterns for per-run outputs (depth=None preserves directory structure)
 _SNAP_RETRIEVE = [
     ("batch_shard.h5", ".", 0),
-    (f"snap_*/{FEFF_XMUDA_FILE}", ".", None),
     (f"snap_*/{FEFF_CHI_FILE}", ".", None),
     (f"snap_*/{FEFF_PATHS_FILE}", ".", None),
     (f"snap_*/{FEFF_FILES_DAT}", ".", None),
@@ -224,7 +222,7 @@ class FeffBatchCalculation(CalcJob):
         spec.exit_code(
             301,
             "ERROR_ALL_RUNS_FAILED",
-            message="Driver produced no xmu.dat outputs.",
+            message="Driver produced no chi.dat outputs.",
         )
 
         spec.inputs.validator = cls._validate_inputs  # type: ignore[assignment]

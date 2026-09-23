@@ -86,7 +86,6 @@ def main(code, do_submit):
         click.echo(f"Finished FeffCalculation pk={node.pk} exit_status={node.exit_status}")
         if node.is_finished_ok:
             xas = node.outputs.xas_data
-            click.echo(f"  energy grid: {xas.energy.shape}  e0={xas.e0:.1f} eV")
             click.echo(f"  chi(k) grid: {xas.chi_k.shape}")
 
 

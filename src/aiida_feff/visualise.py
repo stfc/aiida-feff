@@ -8,10 +8,10 @@ and is an interactive concern, not a provenance-tracked computation step.
 Typical usage::
 
     from aiida.orm import load_node
-    from aiida_feff.visualise import plot_mu_e, plot_chi_k, plot_chi_r
+    from aiida_feff.visualise import plot_chi_k, plot_chi_r
 
     xas = load_node(<pk>)                    # XasData
-    fig = plot_mu_e(xas)
+    fig = plot_chi_k(xas)
 
     # R-space: run the FT calcfunction first, then plot
     from aiida.orm import Dict
@@ -38,7 +38,7 @@ from aiida_feff.data.xasdata import XasData
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
 
-__all__ = ["plot_mu_e", "plot_chi_k", "plot_chi_r"]
+__all__ = ["plot_chi_k", "plot_chi_r"]
 
 
 def _require_matplotlib():
@@ -50,43 +50,6 @@ def _require_matplotlib():
         raise ImportError(
             "matplotlib is required for plotting.  Install with: pip install aiida-feff[plots]"
         ) from exc
-
-
-# ---------------------------------------------------------------------------
-# μ(E)
-# ---------------------------------------------------------------------------
-
-
-def plot_mu_e(
-    xas_data: XasData,
-    *,
-    ax=None,
-    label: str | None = None,
-    show_mu0: bool = False,
-    energy_offset: float = 0.0,
-) -> Figure:
-    """Plot the absorption spectrum μ(E)."""
-    plt = _require_matplotlib()
-
-    energy = xas_data.get_array("energy") + energy_offset
-    mu = xas_data.get_array("mu")
-
-    fig = None
-    if ax is None:
-        fig, ax = plt.subplots()
-
-    _label = label or (xas_data.label or f"pk={xas_data.pk}")
-    ax.plot(energy, mu, label=_label)
-
-    if show_mu0 and "mu0" in xas_data.get_arraynames():
-        ax.plot(energy, xas_data.get_array("mu0"), linestyle="--", label=f"{_label} μ₀")
-
-    ax.set_xlabel("Energy (eV)")
-    ax.set_ylabel("μ(E)")
-    ax.set_title("μ(E)")
-    ax.legend()
-
-    return t.cast("Figure", fig or ax.get_figure())
 
 
 # ---------------------------------------------------------------------------

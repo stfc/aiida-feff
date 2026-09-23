@@ -16,7 +16,7 @@ from aiida_feff.calculations.feff import (
     FEFF_CONTRIBUTIONS_RAW,
     FEFF_LOG_FILE,
     FEFF_PATHS_FILE,
-    FEFF_XMUDA_FILE,
+    absorber_element,
     is_potentials_only,
 )
 from aiida_feff.data.xasdata import XasData
@@ -69,15 +69,15 @@ class FeffParser(Parser):
             feff_version = parse_feff_version(log_text.decode("utf-8", errors="replace"))
 
         # ----------------------------------------------------------------
-        # Check mandatory output file
+        # Check mandatory output file (chi.dat)
         # ----------------------------------------------------------------
-        if FEFF_XMUDA_FILE not in names:
+        if FEFF_CHI_FILE not in names:
             if self._is_potentials_only():
                 # CONTROL switched the spectrum modules off; pot.pad / phase.pad
                 # in the remote folder are the deliverable, and that is success.
                 #
                 # But a run that crashed before FEFF started also produces no
-                # xmu.dat, and would otherwise be indistinguishable from
+                # chi.dat, and would otherwise be indistinguishable from
                 # success -- collect_potentials would then hand an empty
                 # remote folder to every snapshot in the ensemble, and the
                 # whole run would quietly use no potentials at all. The
@@ -90,18 +90,31 @@ class FeffParser(Parser):
                         f"{FEFF_LOG_FILE}: FEFF did not start."
                     )
                     return self.exit_codes.ERROR_POTENTIALS_INCOMPLETE  # type: ignore[no-any-return]
-                self.logger.info("Potentials-only run: no xmu.dat expected.")
+                self.logger.info("Potentials-only run: no chi.dat expected.")
                 return ExitCode(0)
-            return self.exit_codes.ERROR_MISSING_XMUDA  # type: ignore[no-any-return]
+            return self.exit_codes.ERROR_MISSING_CHIDAT  # type: ignore[no-any-return]
 
-        xmu_bytes = retrieved.base.repository.get_object_content(FEFF_XMUDA_FILE, mode="rb")
-        chi_bytes: bytes | None = None
-        if FEFF_CHI_FILE in names:
-            chi_bytes = retrieved.base.repository.get_object_content(FEFF_CHI_FILE, mode="rb")
-
-        xas = _parse_xas(xmu_bytes, chi_bytes, logger=self.logger, feff_version=feff_version)
+        chi_bytes = retrieved.base.repository.get_object_content(FEFF_CHI_FILE, mode="rb")
+        xas = _parse_xas(chi_bytes, logger=self.logger, feff_version=feff_version)
         if xas is None:
-            return self.exit_codes.ERROR_MISSING_XMUDA  # type: ignore[no-any-return]
+            return self.exit_codes.ERROR_MISSING_CHIDAT  # type: ignore[no-any-return]
+
+        # Where in the trajectory this spectrum came from, and what absorbed.
+        # create_serial_shard reads these back when it assembles the archive,
+        # so a missing or wrong value here becomes a mislabelled snapshot
+        # there rather than a visible failure.  The element comes from
+        # ``parameters.absorbing_atom``, which is what FEFF actually ran on;
+        # ``site_idx`` is the ensemble's bookkeeping index and the two only
+        # coincide because EnsembleExafsWorkChain sets both.
+        xas.base.attributes.set(
+            "absorber_element",
+            absorber_element(
+                self.node.inputs.structure,
+                self.node.inputs.parameters.get("absorbing_atom", 0),
+            ),
+        )
+        xas.base.attributes.set("site_index", int(self.node.inputs.site_idx.value))
+        xas.base.attributes.set("frame_index", int(self.node.inputs.frame_idx.value))
 
         self.out("xas_data", xas)
 
@@ -167,106 +180,37 @@ def excerpt_traceback(tb: str) -> str:
 
 
 def _parse_xas(
-    xmu_bytes: bytes,
-    chi_bytes: bytes | None,
+    chi_bytes: bytes,
+    *,
     logger: Any = None,
     feff_version: str | None = None,
 ) -> XasData | None:
-    """Parse raw ``xmu.dat`` bytes (and optionally ``chi.dat``) into an XasData node.
+    """Turn raw ``chi.dat`` bytes into an XasData node.
 
-    This is the core larch parsing logic factored out so both :class:`FeffParser`
-    and :class:`~aiida_feff.parsers.feff_batch.FeffBatchParser` can call it
-    without duplicating the larch import / pre_edge / autobk dance.
+    Shared by :class:`FeffParser` and
+    :class:`~aiida_feff.parsers.feff_batch.FeffBatchParser` so a serial run and
+    a batched one produce byte-identical χ(k) for the same FEFF output.
 
     Args:
-        xmu_bytes: Raw bytes of the FEFF ``xmu.dat`` file.
-        chi_bytes: Raw bytes of FEFF ``chi.dat``, used as fallback if autobk fails.
-            ``None`` skips the fallback.
-        logger: Optional logger for warnings (``logging.Logger`` or AiiDA parser logger).
+        chi_bytes: Raw bytes of the FEFF ``chi.dat`` file.
+        logger: Optional logger for warnings.
         feff_version: FEFF banner parsed from ``log.dat``, recorded on the node.
 
     Returns:
-        Populated :class:`~aiida_feff.data.xasdata.XasData` node, or ``None``
-        if ``xmu_bytes`` could not be parsed.
+        Populated :class:`~aiida_feff.data.xasdata.XasData`, or ``None`` if the
+        file could not be parsed.
     """
-    import os
-    import tempfile
-
-    from larch.io import read_ascii
-    from larch.xafs import autobk, pre_edge
-
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            xmu_path = os.path.join(tmpdir, FEFF_XMUDA_FILE)
-            with open(xmu_path, "wb") as fh:
-                fh.write(xmu_bytes)
-            grp = read_ascii(xmu_path)
+        text = chi_bytes.decode("utf-8", errors="replace")
+        k, chi_k = _parse_chi(text)
     except Exception as exc:  # noqa: BLE001
         if logger:
-            logger.warning("larch read_ascii failed: %s", exc)
+            logger.warning("Failed to parse chi.dat: %s", exc)
         return None
 
-    grp.energy = grp.omega
-
-    try:
-        pre_edge(grp.energy, grp.mu, group=grp, e0=0)
-    except Exception as exc:  # noqa: BLE001
-        if logger:
-            logger.warning("larch pre_edge failed: %s", exc)
-
-    autobk_ok = False
-    autobk_min_points = 5
-    autobk_min_kmax = 2.0
-    try:
-        autobk(grp.energy, grp.mu, group=grp)
-        k_arr = getattr(grp, "k", None)
-        autobk_ok = (
-            k_arr is not None
-            and len(k_arr) > autobk_min_points
-            and float(k_arr.max()) > autobk_min_kmax
-        )
-    except Exception as exc:  # noqa: BLE001
-        if logger:
-            logger.warning("larch autobk failed; will fall back to FEFF chi.dat: %s", exc)
-
-    e0_absolute = 0.0
-    for line in getattr(grp, "header", []):
-        if "e0" in line.lower() and "=" in line:
-            try:
-                e0_absolute = float(line.split("=")[-1])
-                break
-            except ValueError:
-                pass
-
     xas = XasData()
-    mu0 = getattr(grp, "mu0", None)
-    # grp.energy is FEFF's omega column: energy relative to E0.  e0 carries the
-    # absolute threshold so the two can be recombined.
-    xas.set_spectrum(
-        np.asarray(grp.energy),
-        np.asarray(grp.mu),
-        np.asarray(mu0) if mu0 is not None else None,
-        e0=e0_absolute,
-    )
-
-    # Which background algorithm produced chi(k) changes its meaning, so the
-    # choice is recorded rather than left implicit in the numbers.
-    chi_source = "none"
-    if autobk_ok:
-        xas.set_chi(np.asarray(grp.k), np.asarray(grp.chi))
-        chi_source = "larch.autobk"
-    elif chi_bytes is not None:
-        try:
-            k_chi_fb, chi_k_fb = _parse_chi(chi_bytes.decode("utf-8", errors="replace"))
-            xas.set_chi(k_chi_fb, chi_k_fb)
-            chi_source = "feff.chi.dat"
-        except Exception as exc:  # noqa: BLE001
-            if logger:
-                logger.warning("chi.dat fallback failed: %s", exc)
-    elif logger:
-        logger.info("autobk insufficient and no chi.dat; chi(k) will not be available.")
-
-    xas.base.attributes.set("chi_source", chi_source)
+    xas.set_chi(k, chi_k)
+    xas.base.attributes.set("chi_source", "feff.chi.dat")
     xas.base.attributes.set(VERSIONS_ATTR, dependency_versions())
     if feff_version:
         xas.base.attributes.set(FEFF_VERSION_ATTR, feff_version)
@@ -274,7 +218,7 @@ def _parse_xas(
     return xas
 
 
-def _parse_chi(text: str):
+def _parse_chi(text: str) -> tuple[np.ndarray, np.ndarray]:
     """Parse ``chi.dat``.
 
     Columns: k  chi(k)  |chi(k)|  phase(k)
@@ -282,7 +226,11 @@ def _parse_chi(text: str):
     data_lines = [
         line for line in text.splitlines() if line.strip() and not line.strip().startswith("#")
     ]
+    if not data_lines:
+        raise ValueError("chi.dat contains no data lines")
     arr = np.loadtxt(io.StringIO("\n".join(data_lines)))
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
     k = arr[:, 0]
     chi_k = arr[:, 1]
     return k, chi_k

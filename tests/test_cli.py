@@ -42,7 +42,7 @@ class TestShow:
         result = runner.invoke(cmd_show, [str(node.pk)])
         assert result.exit_code == 0, result.output
         assert "chi_k" in result.output
-        assert "7112" in result.output
+        assert "k" in result.output
 
 
 class TestList:

@@ -23,6 +23,8 @@ _GENERATOR_PACKAGES = ("aiida-feff", "pymatgen")
 # Files written to / retrieved from the remote working directory
 FEFF_INPUT_FILE = "feff.inp"
 FEFF_LOG_FILE = "log.dat"
+# Not retrieved: the plugin reads chi(k) from chi.dat and never needs mu(E).
+# Named so the retrieve lists can be asserted against it.
 FEFF_XMUDA_FILE = "xmu.dat"
 FEFF_CHI_FILE = "chi.dat"
 FEFF_PATHS_FILE = "paths.dat"
@@ -66,7 +68,7 @@ _SPECTRUM_MODULES = slice(3, 6)
 def is_potentials_only(control: str | None) -> bool:
     """True when a CONTROL card switches off the spectrum modules (4–6).
 
-    Such a run is *expected* to finish without ``xmu.dat``, so the parser must
+    Such a run is *expected* to finish without ``chi.dat``, so the parser must
     not confuse it with a FEFF crash — which is what treating exit code 310 as
     acceptable used to do.
     """
@@ -180,7 +182,7 @@ class FeffCalculation(CalcJob):
 
     Exit codes
     ----------
-    310  FEFF did not produce ``xmu.dat``.
+    310  FEFF did not produce ``chi.dat``.
     400  Unrecoverable parser error.
 
     Input combinations are rejected by the spec validator before a job is
@@ -196,7 +198,6 @@ class FeffCalculation(CalcJob):
     # ------------------------------------------------------------------
     _DEFAULT_RETRIEVE_LIST = [
         FEFF_LOG_FILE,
-        FEFF_XMUDA_FILE,
         FEFF_CHI_FILE,
         FEFF_PATHS_FILE,
         FEFF_FILES_DAT,  # amplitude ranking; small file, kept for provenance
@@ -326,7 +327,7 @@ class FeffCalculation(CalcJob):
         )
 
         # --- exit codes -------------------------------------------------------
-        spec.exit_code(310, "ERROR_MISSING_XMUDA", message="FEFF did not produce xmu.dat.")
+        spec.exit_code(310, "ERROR_MISSING_CHIDAT", message="FEFF did not produce chi.dat.")
         spec.exit_code(
             311,
             "ERROR_POTENTIALS_INCOMPLETE",

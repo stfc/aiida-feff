@@ -16,19 +16,6 @@ def headless_backend():
     matplotlib.use("Agg")
 
 
-class TestPlotMuE:
-    def test_returns_a_figure(self, generate_xas_data, aiida_profile):
-        from aiida_feff.visualise import plot_mu_e
-
-        assert plot_mu_e(generate_xas_data()).axes
-
-    def test_mu0_is_optional_extra_trace(self, generate_xas_data, aiida_profile):
-        from aiida_feff.visualise import plot_mu_e
-
-        with_mu0 = plot_mu_e(generate_xas_data(), show_mu0=True)
-        assert len(with_mu0.axes[0].get_lines()) == 2
-
-
 class TestPlotChiK:
     def test_applies_k_weighting(self, generate_xas_data, aiida_profile):
         import numpy as np

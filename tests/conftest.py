@@ -274,9 +274,27 @@ def parse_retrieved(aiida_profile_clean):
         node = CalcJobNode()
         # Follow the entry point given, so this fixture can drive either parser.
         node.set_process_type(f"aiida.calculations:{entry_point_name}")
-        # Input links must be attached before the node is stored; the parser
-        # reads them to decide, for example, whether a run was potentials-only.
-        for label, input_node in (inputs or {}).items():
+
+        # FeffCalculation declares structure as required and site_idx /
+        # frame_idx with defaults, so a real calcjob node always carries all
+        # three and FeffParser reads them to label the spectrum.  Supply them
+        # here too, or the fixture exercises a node shape that cannot occur
+        # and the parser has to grow a guard for it.
+        links = dict(inputs or {})
+        if entry_point_name == "feff.feff":
+            from aiida_feff.data.parameters import FeffParameters
+
+            structure = orm.StructureData(cell=[[2.87, 0, 0], [0, 2.87, 0], [0, 0, 2.87]])
+            structure.append_atom(position=(0.0, 0.0, 0.0), symbols="Fe")
+            links.setdefault("structure", structure)
+            links.setdefault("site_idx", orm.Int(0))
+            links.setdefault("frame_idx", orm.Int(0))
+            links.setdefault(
+                "parameters",
+                FeffParameters(dict={"edge": "K", "absorbing_atom": 0}),
+            )
+
+        for label, input_node in links.items():
             stored = input_node if input_node.is_stored else input_node.store()
             node.base.links.add_incoming(stored, link_type=LinkType.INPUT_CALC, link_label=label)
         node.store()

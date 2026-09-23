@@ -36,7 +36,7 @@ visible from the scheduler rather than only from the parser.
         "stream_chunk_size": 256,
         "absorber_elements": ["Fe", "Fe"],
         "scratch_keep_files": ["chi.dat", "files.dat", "log.dat",
-                               "paths.dat", "stderr.txt", "xmu.dat"]
+                               "paths.dat", "stderr.txt"]
     }
 
 ``clean_scratch`` strips each run directory down to ``scratch_keep_files`` once

@@ -69,9 +69,8 @@ DENSE_XMUDA = _dense_xmuda()
 
 @pytest.fixture()
 def retrieved_ok():
-    """FolderData containing both xmu.dat and chi.dat."""
+    """FolderData containing chi.dat."""
     folder = FolderData()
-    folder.base.repository.put_object_from_filelike(io.BytesIO(SAMPLE_XMUDA.encode()), "xmu.dat")
     folder.base.repository.put_object_from_filelike(io.BytesIO(SAMPLE_CHI.encode()), "chi.dat")
     return folder
 
@@ -101,42 +100,32 @@ class TestFeffParserIntegration:
         """Parser must emit an xas_data output for a complete run."""
         result = parse_retrieved(
             entry_point_name="feff.feff",
-            retrieved={"xmu.dat": SAMPLE_XMUDA, "chi.dat": SAMPLE_CHI},
+            retrieved={"chi.dat": SAMPLE_CHI},
         )
         assert "xas_data" in result.outputs
 
     def test_xas_data_arrays(self, parse_retrieved):
         result = parse_retrieved(
             entry_point_name="feff.feff",
-            retrieved={"xmu.dat": SAMPLE_XMUDA, "chi.dat": SAMPLE_CHI},
+            retrieved={"chi.dat": SAMPLE_CHI},
         )
         xas = result.outputs.xas_data
-        assert "energy" in xas.get_arraynames()
         assert "k" in xas.get_arraynames()
         assert "chi_k" in xas.get_arraynames()
+        assert "energy" not in xas.get_arraynames()
+        assert "mu" not in xas.get_arraynames()
 
-    def test_no_chi_exit_ok(self, parse_retrieved):
-        """Parser should succeed (exit 0) when chi.dat is absent."""
-        result = parse_retrieved(
-            entry_point_name="feff.feff",
-            retrieved={"xmu.dat": SAMPLE_XMUDA},
-        )
-        assert result.exit_status == 0
-        assert "xas_data" in result.outputs
-        xas = result.outputs.xas_data
-        assert "chi_k" not in xas.get_arraynames()
-
-    def test_missing_xmuda_returns_error(self, parse_retrieved):
-        """Parser must return ERROR_MISSING_XMUDA when xmu.dat is absent."""
+    def test_missing_chi_returns_error(self, parse_retrieved):
+        """Parser must return ERROR_MISSING_CHIDAT when chi.dat is absent."""
         result = parse_retrieved(
             entry_point_name="feff.feff",
             retrieved={},
         )
-        assert result.exit_status == FeffCalculation.exit_codes.ERROR_MISSING_XMUDA.status
+        assert result.exit_status == FeffCalculation.exit_codes.ERROR_MISSING_CHIDAT.status
 
 
 class TestPotentialsOnlyRuns:
-    """A CONTROL card with modules 4-6 off legitimately produces no xmu.dat."""
+    """A CONTROL card with modules 4-6 off legitimately produces no chi.dat."""
 
     @staticmethod
     def _parameters(control):
@@ -144,7 +133,7 @@ class TestPotentialsOnlyRuns:
 
         return FeffParameters(dict={"edge": "K", "control": control})
 
-    def test_missing_xmu_is_success_for_a_potentials_only_run(self, parse_retrieved):
+    def test_missing_chi_is_success_for_a_potentials_only_run(self, parse_retrieved):
         from aiida_feff.calculations.feff import CONTROL_POT_ONLY
 
         result = parse_retrieved(
@@ -157,7 +146,7 @@ class TestPotentialsOnlyRuns:
         assert result.exit_status == 0
         assert "xas_data" not in result.outputs
 
-    def test_missing_xmu_is_still_an_error_for_a_spectrum_run(self, parse_retrieved):
+    def test_missing_chi_is_still_an_error_for_a_spectrum_run(self, parse_retrieved):
         from aiida_feff.calculations.feff import CONTROL_NO_POT
 
         result = parse_retrieved(
@@ -165,15 +154,10 @@ class TestPotentialsOnlyRuns:
             retrieved={"log.dat": "Feff8L (EXAFS)  0.1\n"},
             inputs={"parameters": self._parameters(CONTROL_NO_POT)},
         )
-        assert result.exit_status == FeffCalculation.exit_codes.ERROR_MISSING_XMUDA.status
+        assert result.exit_status == FeffCalculation.exit_codes.ERROR_MISSING_CHIDAT.status
 
     def test_a_potentials_run_that_never_started_is_not_success(self, parse_retrieved):
-        """An empty log means FEFF never ran, whatever CONTROL asked for.
-
-        Without this the parser cannot tell a crashed potentials run from a
-        successful one -- both simply lack xmu.dat -- and the workchain would
-        hand an empty remote folder to every snapshot in the ensemble.
-        """
+        """An empty log means FEFF never ran, whatever CONTROL asked for."""
         from aiida_feff.calculations.feff import CONTROL_POT_ONLY
 
         result = parse_retrieved(
@@ -207,59 +191,23 @@ class TestIsPotentialsOnly:
 class TestParsedMetadata:
     """What the parser records so the spectrum can be reproduced later."""
 
-    def test_energy_is_relative_and_e0_is_absolute(self, parse_retrieved):
-        result = parse_retrieved(entry_point_name="feff.feff", retrieved={"xmu.dat": SAMPLE_XMUDA})
-        xas = result.outputs.xas_data
-        assert xas.e0 == pytest.approx(7112.0)
-        # omega runs from -20; absolute_energy puts it back on the real scale.
-        assert xas.energy.min() == pytest.approx(-20.0)
-        assert xas.absolute_energy.min() == pytest.approx(7092.0)
-
-    def test_e0_is_an_attribute_not_an_extra(self, parse_retrieved):
-        """Extras stay mutable after storage and are excluded from the hash."""
-        result = parse_retrieved(entry_point_name="feff.feff", retrieved={"xmu.dat": SAMPLE_XMUDA})
-        assert result.outputs.xas_data.base.attributes.get("e0") == pytest.approx(7112.0)
-
     def test_feff_and_library_versions_are_recorded(self, parse_retrieved):
         result = parse_retrieved(
             entry_point_name="feff.feff",
-            retrieved={"xmu.dat": SAMPLE_XMUDA, "log.dat": "  Feff 8.50L\n"},
+            retrieved={"chi.dat": SAMPLE_CHI, "log.dat": "  Feff 8.50L\n"},
         )
         xas = result.outputs.xas_data
         assert xas.base.attributes.get("feff_version") == "Feff8.50L"
         assert "xraylarch" in xas.base.attributes.get("code_versions")
 
-    def test_chi_source_records_autobk_when_the_spline_succeeds(self, parse_retrieved):
-        """larch's spline background and FEFF's mu0 are different definitions.
-
-        The three branches are asserted separately and by exact value. The
-        previous version accepted ``in {"larch.autobk", "feff.chi.dat"}``,
-        i.e. either answer to the question it was posing, so it could not
-        detect the parser silently switching background algorithm -- which
-        changes what chi(k) means.
-        """
-        result = parse_retrieved(entry_point_name="feff.feff", retrieved={"xmu.dat": DENSE_XMUDA})
-        xas = result.outputs.xas_data
-        assert xas.base.attributes.get("chi_source") == "larch.autobk"
-        assert "chi_k" in xas.get_arraynames()
-
-    def test_chi_source_falls_back_to_feffs_own_chi(self, parse_retrieved):
-        """Too few points for a spline, but chi.dat is there to use instead."""
+    def test_chi_source_records_feff_chi_dat(self, parse_retrieved):
         result = parse_retrieved(
             entry_point_name="feff.feff",
-            retrieved={"xmu.dat": SAMPLE_XMUDA, "chi.dat": SAMPLE_CHI},
+            retrieved={"chi.dat": SAMPLE_CHI},
         )
         xas = result.outputs.xas_data
         assert xas.base.attributes.get("chi_source") == "feff.chi.dat"
-        # ...and the values really are FEFF's, not a spline's.
         assert xas.get_array("chi_k")[2] == pytest.approx(0.08912, rel=1e-4)
-
-    def test_chi_source_is_none_when_neither_route_works(self, parse_retrieved):
-        """No usable chi(k) must be recorded as such, not left to look valid."""
-        result = parse_retrieved(entry_point_name="feff.feff", retrieved={"xmu.dat": SAMPLE_XMUDA})
-        xas = result.outputs.xas_data
-        assert xas.base.attributes.get("chi_source") == "none"
-        assert "chi_k" not in xas.get_arraynames()
 
 
 class TestExcerptTraceback:

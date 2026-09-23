@@ -103,7 +103,40 @@ PY
 )
 uv run --project "$REPO" python "$REPO/examples/example_ensemble.py" \
   --code feff@localhost --trajectory-pk "$TRAJ_PK" 2>&1 | tee ensemble.log
-grep -qi "finished" ensemble.log || fail "example_ensemble.py did not report a finished workchain"
+WC_PK=$(sed -n 's/.*Submitted EnsembleExafsWorkChain pk=\([0-9]*\).*/\1/p' ensemble.log)
+[ -n "$WC_PK" ] || fail "example_ensemble.py submitted nothing"
+
+# This example calls submit() rather than run(), so it returns as soon as the
+# workchain is handed to the daemon and never reports an outcome itself. That
+# is the point of it, and the only example that exercises the daemon and the
+# broker at all, so the waiting belongs here rather than in the example.
+uv run --project "$REPO" python - "$WC_PK" <<'PY' || fail "submitted workchain did not finish cleanly"
+import sys
+import time
+
+from aiida import load_profile, orm
+
+load_profile()
+pk = int(sys.argv[1])
+node = orm.load_node(pk)
+deadline = time.time() + 900
+while not node.is_terminated and time.time() < deadline:
+    time.sleep(5)
+    node = orm.load_node(pk)
+
+if not node.is_terminated:
+    print(f"workchain {pk} still {node.process_state} after 15 minutes")
+    sys.exit(1)
+if not node.is_finished_ok:
+    print(f"workchain {pk} finished with exit status {node.exit_status}: {node.exit_message}")
+    sys.exit(1)
+# An archive proves the run got all the way through the merge, not merely that
+# the daemon picked it up and stopped somewhere.
+if "archive" not in node.outputs:
+    print(f"workchain {pk} finished without an archive output")
+    sys.exit(1)
+print(f"workchain {pk} finished OK with an archive")
+PY
 
 echo
 echo "✓ all examples ran and demonstrated what they claim to."

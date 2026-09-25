@@ -416,6 +416,7 @@ class FeffBatchCalculation(CalcJob):
         if use_precomputed:
             for key, remote in self.inputs.remote_potentials.items():
                 # key is like 'site_0000'
+                folder.get_subfolder(f"potentials/{key}", create=True)
                 remote_path = remote.get_remote_path()
                 computer_uuid = remote.computer.uuid
                 for fname in FEFF_POTENTIAL_FILES:

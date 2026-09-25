@@ -20,27 +20,123 @@ from aiida.engine import run_get_node
 
 from aiida_feff.workflows.ensemble import EnsembleExafsWorkChain
 
-# A FEFF stand-in: writes the columns the parser reads, with an r-dependent
-# oscillation so different sites give different spectra.
+# A FEFF stand-in that reads its own input.
+#
+# The previous version hardcoded R = 2.5 and never opened feff.inp, so every
+# frame, every site and every absorber produced a byte-identical xmu.dat.
+# That silently defeated the tests built on top of it: batch-vs-serial
+# equivalence, per-site averaging and snapshot de-duplication all compared
+# copies of one array and could not fail. It also could not catch a wrong
+# frame->spectrum or site->spectrum assignment.
+#
+# This version derives R from the geometry FEFF was actually handed -- the
+# nearest-neighbour distance in the ATOMS block, with the absorber at the
+# origin by construction -- so each snapshot has a *known correct* spectrum
+# and tests can assert identity rather than mere difference.
+#
+# Note on resolution: the trajectory fixture jitters positions by 0.02 A, so
+# frame-to-frame Delta-R is ~0.03 A, just under the 0.0307 A chi(R) bin. Frames
+# are therefore NOT separable in R space. In k space the phase difference
+# 2*k*Delta-R reaches ~0.9 rad by k=15, which is comfortably resolvable, so
+# every assertion below works in k space.
 FAKE_FEFF = textwrap.dedent("""\
     #!/bin/bash
     python3 - <<'PY'
     import math
+
+    def nearest_neighbour_distance(path="feff.inp"):
+        \"\"\"Smallest absorber-scatterer distance in the ATOMS block.
+
+        The absorber is ipot 0 at the origin, so this is just the smallest
+        non-zero radius. Falls back to a sentinel only if ATOMS is missing,
+        which would itself be a bug worth seeing in the output.
+        \"\"\"
+        try:
+            lines = open(path).read().splitlines()
+        except OSError:
+            return -1.0
+        try:
+            start = next(i for i, l in enumerate(lines) if l.strip().startswith("ATOMS"))
+        except StopIteration:
+            return -1.0
+        radii = []
+        for line in lines[start + 1:]:
+            if line.strip().startswith("END"):
+                break
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            try:
+                x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
+            except ValueError:
+                continue
+            r = math.sqrt(x * x + y * y + z * z)
+            if r > 1e-9:
+                radii.append(r)
+        return min(radii) if radii else -1.0
+
+    R = nearest_neighbour_distance()
     rows = []
     for i in range(120):
         omega = -20.0 + i * 2.0
         k = math.sqrt(max(omega, 0.0) * 0.2624684)
-        mu = 1.0 + 0.1 * math.sin(2 * k * 2.5) * math.exp(-0.05 * k * k)
+        chi = 0.1 * math.sin(2 * k * R) * math.exp(-0.05 * k * k)
+        mu = 1.0 + chi
         rows.append(f"{omega:10.4f} {omega:10.4f} {k:10.4f} {mu:10.5f} {1.0:10.5f} {0.0:10.5f}")
+
+    # chi.dat gets its own uniform k grid rather than reusing the omega grid
+    # above. The archive resamples chi.dat onto k = 0.05, 0.10, ... so a
+    # sparse non-uniform source would leave interpolation error in every
+    # comparison and force tests to use tolerances loose enough to hide a
+    # real merge bug. Sampling the same grid the archive uses makes the
+    # round trip exact.
+    chi_rows = []
+    for i in range(1, 401):
+        k = 0.05 * i
+        chi = 0.1 * math.sin(2 * k * R) * math.exp(-0.05 * k * k)
+        chi_rows.append(f"{k:10.4f} {chi:12.6e} {abs(chi):12.6e} {0.0:10.4f}")
+
     header = [
         "# Feff8L (EXAFS)  0.1",
         "# e0 = 7112.00",
         "#   omega      e        k        mu       mu0      chi",
     ]
     open("xmu.dat", "w").write("\\n".join(header + rows) + "\\n")
+    # chi.dat is what the batch shard is built from, so the stand-in has to
+    # write it too or the batch tests silently skip the archive path.
+    chi_header = ["# Feff8L (EXAFS)  0.1", "#    k          chi          mag        phase"]
+    open("chi.dat", "w").write("\\n".join(chi_header + chi_rows) + "\\n")
     open("files.dat", "w").write("Feff8L (EXAFS)  0.1\\n")
+    # Record the geometry this run actually saw, so tests can verify that the
+    # right structure reached the right snapshot directory.
+    open("stand_in_R.txt", "w").write(f"{R!r}\\n")
     PY
     """)
+
+
+def expected_chi(k, r):
+    """The stand-in's spectrum for a given nearest-neighbour distance.
+
+    Kept in the test module so assertions state the expected physics rather
+    than re-deriving it from whatever the stand-in happened to write.
+    """
+    return 0.1 * np.sin(2 * k * r) * np.exp(-0.05 * k * k)
+
+
+def nn_distance(positions, cell, site):
+    """Minimum-image nearest-neighbour distance from ``site`` in a cell."""
+    deltas = positions - positions[site]
+    frac = deltas @ np.linalg.inv(cell)
+    frac -= np.round(frac)
+    radii = np.linalg.norm(frac @ cell, axis=1)
+    return float(radii[radii > 1e-9].min())
+
+
+def _frame_nn_distances(trajectory, site):
+    """Nearest-neighbour distance at ``site`` for every frame of a trajectory."""
+    positions = trajectory.get_array("positions")
+    cells = trajectory.get_array("cells")
+    return [nn_distance(positions[f], cells[f], site) for f in range(len(positions))]
 
 
 @pytest.fixture()
@@ -148,6 +244,75 @@ class TestPotentialReuse:
         assert any(label.startswith("pot_site_") for label in labels)
 
 
+def feff_rejecting_short_bonds(directory, computer, min_r=2.0, label="picky-feff"):
+    """A stand-in that fails on snapshots whose nearest bond is shorter than ``min_r``.
+
+    Partial failure is the normal outcome of a real ensemble run -- one
+    snapshot lands on a pathological geometry -- but every failure test here
+    used to make *all* children fail, so the partial-failure and
+    potentials-failure exit codes were never reached.
+
+    Failure is keyed on the *input geometry* rather than on invocation
+    order. An earlier version of this helper counted invocations in a shared
+    file, which silently did not work: the workchain runs its children
+    concurrently, so all three read the counter after all three had
+    incremented it, every run saw N=3, and no run ever failed. Keying on the
+    input makes which snapshot fails deterministic and independent of
+    scheduling.
+    """
+    guard = textwrap.dedent(f"""\
+        #!/bin/bash
+        MIN_R={min_r}
+        python3 - <<'CHECK' || exit 1
+        import math, sys
+        lines = open("feff.inp").read().splitlines()
+        start = next(i for i, l in enumerate(lines) if l.strip().startswith("ATOMS"))
+        radii = []
+        for line in lines[start + 1:]:
+            if line.strip().startswith("END"):
+                break
+            p = line.split()
+            if len(p) < 4:
+                continue
+            try:
+                r = math.sqrt(float(p[0])**2 + float(p[1])**2 + float(p[2])**2)
+            except ValueError:
+                continue
+            if r > 1e-9:
+                radii.append(r)
+        sys.exit(1 if radii and min(radii) < {min_r} else 0)
+        CHECK
+        """)
+    script = directory / f"{label}.sh"
+    script.write_text(guard + FAKE_FEFF.split("\n", 1)[1])
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return orm.InstalledCode(
+        label=label, computer=computer, filepath_executable=str(script)
+    ).store()
+
+
+def trajectory_with_bad_frames(bad_frames, n_frames=3, a=2.87):
+    """Trajectory where ``bad_frames`` have a collapsed bond (~1.04 A).
+
+    Good frames sit at the normal bcc nearest-neighbour distance (~2.48 A),
+    so a stand-in thresholding at 2.0 A separates them cleanly.
+    """
+    rng = np.random.default_rng(0)
+    positions = np.empty((n_frames, 2, 3))
+    for frame in range(n_frames):
+        second = [0.6, 0.6, 0.6] if frame in bad_frames else [a / 2, a / 2, a / 2]
+        positions[frame] = np.array([[0.0, 0.0, 0.0], second])
+        if frame not in bad_frames:
+            positions[frame] += rng.normal(scale=0.02, size=(2, 3))
+
+    traj = orm.TrajectoryData()
+    traj.set_array("positions", positions)
+    traj.set_array("cells", np.tile(np.eye(3) * a, (n_frames, 1, 1)))
+    traj.set_array("steps", np.arange(n_frames))
+    traj.base.attributes.set("symbols", ["Fe", "Fe"])
+    return traj.store()
+
+
 @pytest.mark.usefixtures("aiida_profile_clean")
 class TestFailureHandling:
     @pytest.fixture()
@@ -169,6 +334,102 @@ class TestFailureHandling:
         )
         assert not node.is_finished_ok
         assert node.exit_status == EnsembleExafsWorkChain.exit_codes.ERROR_ALL_FAILED.status
+
+    def test_one_failure_among_several_is_reported_as_partial(
+        self, tmp_path_factory, aiida_localhost, aiida_profile
+    ):
+        """Some snapshots failing must not be reported as total success or total failure.
+
+        This is the normal outcome of a real ensemble run, and it was the
+        single largest untested branch in the workchain.
+        """
+        from aiida_feff.data.parameters import FeffParameters
+
+        tmp = tmp_path_factory.mktemp("partialfeff")
+        code = feff_rejecting_short_bonds(tmp, aiida_localhost, label="partial-feff")
+
+        results, node = run_workchain(
+            code=code,
+            trajectory=trajectory_with_bad_frames([1]),
+            parameters=FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atom": 0}),
+        )
+
+        assert not node.is_finished_ok
+        assert node.exit_status == EnsembleExafsWorkChain.exit_codes.ERROR_PARTIAL_FAILURE.status
+        # The surviving snapshots must still be averaged and reported, rather
+        # than the whole run being discarded.
+        assert results["n_failed"].value == 1
+        assert results["averaged_xas"]["all"].base.attributes.get("n_snapshots") == 2
+
+    def test_a_failed_potentials_run_stops_the_workchain(
+        self, tmp_path_factory, aiida_localhost, aiida_profile
+    ):
+        """Potentials are shared by every snapshot, so a failure there is fatal.
+
+        Continuing would silently run the whole ensemble against absent or
+        stale potentials.
+        """
+        from aiida_feff.data.parameters import FeffParameters
+
+        tmp = tmp_path_factory.mktemp("potfeff")
+        code = feff_rejecting_short_bonds(tmp, aiida_localhost, label="pot-broken-feff")
+
+        # precompute_potentials_step uses ctx.structures[-1], so the bad
+        # geometry has to be in the last frame for the potentials run to hit it.
+        _results, node = run_workchain(
+            code=code,
+            trajectory=trajectory_with_bad_frames([2]),
+            precompute_potentials=orm.Bool(True),
+            parameters=FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atom": 0}),
+        )
+
+        assert not node.is_finished_ok
+        assert node.exit_status == EnsembleExafsWorkChain.exit_codes.ERROR_POTENTIALS_FAILED.status
+        # It must stop at the potentials stage, not fan out anyway.
+        assert not [c for c in node.called if c.label.startswith("snap_")]
+
+    def test_partial_potentials_failure_allows_healthy_sites_to_continue(
+        self, tmp_path_factory, aiida_localhost, two_site_trajectory
+    ):
+        """When precompute fails on one site, healthy sites proceed and produce averages."""
+        from aiida_feff.data.parameters import FeffParameters
+
+        tmp = tmp_path_factory.mktemp("partial_potfeff")
+        # Stand-in that fails ONLY on site 1's potentials run
+        guard = textwrap.dedent("""\
+            #!/bin/bash
+            python3 - <<'CHECK' || exit 1
+            import sys
+            content = open("feff.inp").read()
+            is_pot = "1 1 1 0 0 0" in content
+            is_site_1 = "Absorber site index: 1" in content
+            if is_pot and is_site_1:
+                sys.exit(1)
+            sys.exit(0)
+            CHECK
+            """)
+        script = tmp / "partial_pot_feff.sh"
+        script.write_text(guard + FAKE_FEFF.split("\n", 1)[1])
+        script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        code = orm.InstalledCode(
+            label="partial-pot-feff", computer=aiida_localhost, filepath_executable=str(script)
+        ).store()
+
+        results, node = run_workchain(
+            code=code,
+            trajectory=two_site_trajectory,
+            precompute_potentials=orm.Bool(True),
+            parameters=FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atoms": "Fe"}),
+        )
+
+        assert not node.is_finished_ok
+        assert node.exit_status == EnsembleExafsWorkChain.exit_codes.ERROR_PARTIAL_FAILURE.status
+        assert results["n_failed"].value == 3
+        averaged = results["averaged_xas"]
+        assert "site_0000" in averaged
+        assert "site_0001" not in averaged
+        assert "all" in averaged
+        assert averaged["all"].base.attributes.get("n_snapshots") == 3
 
 
 @pytest.mark.usefixtures("aiida_profile_clean")
@@ -227,12 +488,141 @@ class TestBatchMode:
         batch_children = [c for c in node.called if c.label.startswith("batch_")]
         assert len(batch_children) == 2
 
+    def test_batch_run_produces_a_consolidated_archive(
+        self, fake_feff_code, python_code, two_site_trajectory
+    ):
+        """Every batch shard must end up merged into the single 'archive' output (ADR 0004)."""
+        from aiida_feff.data.archive import ExafsArchiveData
+        from aiida_feff.data.parameters import FeffParameters
+
+        results, node = run_workchain(
+            code=fake_feff_code,
+            python_code=python_code,
+            trajectory=two_site_trajectory,
+            batch_size=orm.Int(2),
+            parameters=FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atom": 0}),
+        )
+        assert node.is_finished_ok, node.exit_message
+
+        # Each batch CalcJob emits its own shard...
+        shards = [c.outputs.archive for c in node.called if c.label.startswith("batch_")]
+        assert len(shards) == 2
+        assert all(s.is_shard for s in shards)
+
+        # ...and the workchain consolidates them into one ensemble archive.
+        archive = results["archive"]
+        assert isinstance(archive, ExafsArchiveData)
+        assert archive.is_ensemble
+        assert archive.k.size > 0
+        assert np.abs(archive.chi).max() > 0, "ensemble chi(k) is identically zero"
+
+        # The shards must genuinely differ. If they did not, every assertion
+        # below would hold for a merge that dropped or duplicated snapshots,
+        # which is precisely the hole the old constant stand-in left.
+        assert not np.allclose(shards[0].chi, shards[1].chi), (
+            "shards are identical -- the stand-in is not reading feff.inp, "
+            "so this test cannot detect a mis-merged ensemble"
+        )
+
+        # The ensemble archive must be the mean over snapshots of the spectrum
+        # each snapshot's own geometry implies. A merge that dropped a frame,
+        # double-counted one, or zero-filled a gap fails here.
+        expected = np.mean(
+            [expected_chi(archive.k, r) for r in _frame_nn_distances(two_site_trajectory, site=0)],
+            axis=0,
+        )
+        # Amplitude-relative tolerance, not a bare atol and not rtol.
+        #
+        # rtol is wrong for an oscillating signal: it explodes at every zero
+        # crossing of chi(k) and would force a tolerance loose enough to hide
+        # a real merge bug. A bare atol would silently track the stand-in's
+        # arbitrary 0.1 prefactor. Scaling by the measured amplitude is
+        # scale-free and stays meaningful if the stand-in changes.
+        #
+        # The floor is 8.8e-6 of amplitude, set by R round-tripping through
+        # feff.inp's finite coordinate precision (~2e-6 A), so 1e-4 leaves
+        # about a factor of ten of headroom.
+        tol = 1e-4 * np.abs(expected).max()
+        np.testing.assert_allclose(archive.chi, expected, rtol=0.0, atol=tol)
+
+        # averaged_xas is derived directly from the archive, so they agree bit-for-bit.
+        np.testing.assert_array_equal(
+            results["averaged_xas"]["all"].get_array("chi_k"), archive.chi
+        )
+
+    def test_serial_path_produces_archive(self, fake_feff_code, two_site_trajectory):
+        """Serial path writes a shard via BatchShardWriter, so archive always exists."""
+        from aiida_feff.data.parameters import FeffParameters
+
+        results, node = run_workchain(
+            code=fake_feff_code,
+            trajectory=two_site_trajectory,
+            parameters=FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atom": 0}),
+        )
+        assert node.is_finished_ok, node.exit_message
+        assert "archive" in results
+        assert results["archive"].is_ensemble
+
+    def test_no_shard_fails_instead_of_finishing_empty(self, aiida_localhost):
+        """Spectra but no shard must be an exit code, not a successful empty run.
+
+        Nothing else catches this.  ``averaged_xas`` is a *required* output,
+        but it is a dynamic namespace with no declared child ports, and
+        validating one of those against an unspecified value returns no error
+        — so plumpy's required-output check is satisfied by the ``n_failed``
+        output alone and the workchain used to finish at exit 0 having
+        produced neither an archive nor a single averaged spectrum.
+
+        The empty ``ctx.shards`` is reached for real when the batch driver
+        swallows an md-exafs ImportError and writes no ``batch_shard.h5``:
+        retrieval ignores the missing file, the batch parser emits no
+        ``archive``, and ``inspect_batch_results`` only reports it.  Driving
+        that end to end would mean breaking an import inside the remote
+        interpreter, so the step is called directly on the state it produces.
+        """
+        from aiida.engine.utils import instantiate_process
+        from aiida.manage import get_manager
+
+        from aiida_feff.data.parameters import FeffParameters
+        from aiida_feff.data.xasdata import XasData
+
+        structure = orm.StructureData(cell=np.eye(3) * 2.87)
+        structure.append_atom(position=(0.0, 0.0, 0.0), symbols="Fe")
+        code = orm.InstalledCode(
+            label="unused-feff", computer=aiida_localhost, filepath_executable="/bin/true"
+        ).store()
+
+        process = instantiate_process(
+            get_manager().get_runner(),
+            EnsembleExafsWorkChain,
+            code=code,
+            structures={"snap_0000": structure.store()},
+            parameters=FeffParameters(dict={"edge": "K", "radius": 5.5, "absorbing_atom": 0}),
+            options=orm.Dict(OPTIONS),
+        )
+
+        xas = XasData()
+        xas.set_chi(np.linspace(0.05, 19.95, 10), np.zeros(10))
+        process.ctx.all_xas = {"snap_0000_site_0000": xas.store()}
+        process.ctx.successful_paths = {}
+        process.ctx.shards = {}
+        process.ctx.n_failed = 0
+        process.ctx.n_total = 1
+
+        exit_code = process.average_results()
+
+        assert exit_code is not None, "no archive, yet the workchain reported success"
+        assert exit_code.status == EnsembleExafsWorkChain.exit_codes.ERROR_NO_ARCHIVE.status
+        assert "archive" not in process.outputs
+        assert not process.outputs.get("averaged_xas", {})
+
     def test_batch_and_serial_paths_agree(self, fake_feff_code, python_code, two_site_trajectory):
         """Batching is a scheduling choice; it must not change the physics."""
         from aiida_feff.data.parameters import FeffParameters
 
-        def average(**extra):
+        def run(batch_mode: bool):
             params = FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atom": 0})
+            extra = {"python_code": python_code, "batch_size": orm.Int(3)} if batch_mode else {}
             results, node = run_workchain(
                 code=fake_feff_code,
                 trajectory=two_site_trajectory,
@@ -240,13 +630,58 @@ class TestBatchMode:
                 **extra,
             )
             assert node.is_finished_ok, node.exit_message
+            return results
+
+        serial_results = run(batch_mode=False)
+        batched_results = run(batch_mode=True)
+
+        serial_archive = serial_results["archive"]
+        batched_archive = batched_results["archive"]
+
+        # Bit-for-bit comparison of two archives (Handoff Phase 2)
+        np.testing.assert_array_equal(serial_archive.chi, batched_archive.chi)
+        np.testing.assert_array_equal(serial_archive.k, batched_archive.k)
+
+        serial_xas = serial_results["averaged_xas"]["all"]
+        batched_xas = batched_results["averaged_xas"]["all"]
+        np.testing.assert_array_equal(serial_xas.get_array("chi_k"), batched_xas.get_array("chi_k"))
+        np.testing.assert_array_equal(serial_xas.get_array("k"), batched_xas.get_array("k"))
+
+    def test_clean_scratch_does_not_change_the_spectrum(
+        self, fake_feff_code, python_code, two_site_trajectory
+    ):
+        """clean_scratch reclaims disk only; every parsed array must be bit-identical.
+
+        Asserting n_snapshots or the node type would pass even if the averaged
+        spectrum silently changed grid, amplitude or provenance. Compare the arrays instead.
+        """
+        from aiida_feff.data.parameters import FeffParameters
+
+        def average(**extra):
+            results, node = run_workchain(
+                code=fake_feff_code,
+                python_code=python_code,
+                trajectory=two_site_trajectory,
+                batch_size=orm.Int(2),
+                parameters=FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atom": 0}),
+                **extra,
+            )
+            assert node.is_finished_ok, node.exit_message
+            assert results["n_failed"].value == 0
             return results["averaged_xas"]["all"]
 
-        serial = average()
-        batched = average(python_code=python_code, batch_size=orm.Int(3))
-        np.testing.assert_allclose(
-            batched.get_array("chi_k"), serial.get_array("chi_k"), rtol=1e-10
-        )
+        clean = average(clean_scratch=orm.Bool(True), stream_chunk_size=orm.Int(1))
+        dirty = average(clean_scratch=orm.Bool(False))
+
+        assert set(clean.get_arraynames()) == set(dirty.get_arraynames())
+        assert {"chi_k", "k"} <= set(clean.get_arraynames())
+        assert "energy" not in clean.get_arraynames()
+        assert "mu" not in clean.get_arraynames()
+
+        for name in sorted(dirty.get_arraynames()):
+            np.testing.assert_array_equal(
+                clean.get_array(name), dirty.get_array(name), err_msg=f"array {name} differs"
+            )
 
     def test_batch_size_without_python_code_is_refused(self, fake_feff_code, two_site_trajectory):
         from aiida_feff.data.parameters import FeffParameters
@@ -259,3 +694,70 @@ class TestBatchMode:
         )
         expected = EnsembleExafsWorkChain.exit_codes.ERROR_MISSING_AGGREGATION_CODE
         assert node.exit_status == expected.status
+
+
+# The default stand-in writes chi.dat on exactly the grid the archive uses, so
+# the round trip is exact and every assertion above can use array equality.
+# Real FEFF does not oblige: the grid runs to whatever the EXAFS card asks for,
+# and starts at k=0 or k=0.05 depending on the run, giving 400 or 401 rows.
+# This variant reproduces both departures at once -- a short spectrum on the
+# offset grid -- because that combination used to produce an all-NaN chi(R).
+_SHORT_CHI_FROM = "for i in range(1, 401):"
+_SHORT_CHI_TO = "for i in range(0, 281):"
+assert _SHORT_CHI_FROM in FAKE_FEFF, "stand-in chi.dat loop moved; SHORT_CHI_FEFF is a no-op"
+SHORT_CHI_FEFF = FAKE_FEFF.replace(_SHORT_CHI_FROM, _SHORT_CHI_TO)
+
+
+@pytest.fixture()
+def short_chi_feff_code(tmp_path_factory, aiida_localhost):
+    """Stand-in whose chi.dat stops at k = 14, as `EXAFS 14` would."""
+    script = tmp_path_factory.mktemp("shortfeff") / "feff.sh"
+    script.write_text(SHORT_CHI_FEFF)
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return orm.InstalledCode(
+        label="short-chi-feff", computer=aiida_localhost, filepath_executable=str(script)
+    ).store()
+
+
+@pytest.mark.usefixtures("aiida_profile_clean")
+class TestShortChiDat:
+    """A chi.dat shorter than the archive grid must not blank the transform."""
+
+    def test_short_chi_dat_still_gives_a_finite_chi_r(
+        self, short_chi_feff_code, two_site_trajectory
+    ):
+        from aiida_feff.data.parameters import FeffParameters
+
+        results, node = run_workchain(
+            code=short_chi_feff_code,
+            trajectory=two_site_trajectory,
+            parameters=FeffParameters(dict={"edge": "K", "radius": 4.0, "absorbing_atom": 0}),
+        )
+        assert node.is_finished_ok, node.exit_message
+
+        archive = results["archive"]
+        # chi(R) is what a NaN anywhere on the k grid used to destroy: the
+        # window multiplies the whole array and 0 * nan is nan.
+        assert np.isfinite(archive.chir_mag).all()
+        assert archive.chir_mag.max() > 0.0
+
+        k = archive.k
+        chi = archive.chi
+        # chi(k) still says honestly where the ensemble ran out of data,
+        # rather than reporting a zero that would read as a real datum.
+        assert np.isfinite(chi[k <= 14.0]).all()
+        assert np.isnan(chi[k > 14.0]).all()
+
+        counts = results["averaged_xas"]["all"].get_array("chi_k_count")
+        assert (counts[k <= 14.0] == 3).all()
+        assert (counts[k > 14.0] == 0).all()
+
+    def test_offset_grid_alone_loses_no_data(self, short_chi_feff_code, two_site_trajectory):
+        """The 400-row grid ends at 19.95, the archive grid's last point.
+
+        np.arange(0.05, 20.0, 0.05) overshoots it by 3.6e-15, which used to
+        resample to NaN and take the whole transform with it.
+        """
+        from md_exafs.execution import DEFAULT_K_GRID
+
+        assert DEFAULT_K_GRID[-1] == 19.95

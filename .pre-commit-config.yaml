@@ -12,9 +12,12 @@ repos:
       # installs mypy into an isolated venv without aiida, numpy or pymatgen,
       # so every annotation from those packages degrades to Any and the check
       # passes vacuously.
+      # --no-sync: type-checking should not re-resolve the dependency tree on
+      # every commit. CI runs `uv sync --all-extras` before pre-commit, and
+      # locally the environment is the developer's to manage.
       - id: mypy
         name: mypy
-        entry: uv run mypy src
+        entry: uv run --no-sync mypy src
         language: system
         types: [python]
         pass_filenames: false

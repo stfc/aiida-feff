@@ -8,10 +8,10 @@ and is an interactive concern, not a provenance-tracked computation step.
 Typical usage::
 
     from aiida.orm import load_node
-    from aiida_feff.visualise import plot_mu_e, plot_chi_k, plot_chi_r
+    from aiida_feff.visualise import plot_chi_k, plot_chi_r
 
     xas = load_node(<pk>)                    # XasData
-    fig = plot_mu_e(xas)
+    fig = plot_chi_k(xas)
 
     # R-space: run the FT calcfunction first, then plot
     from aiida.orm import Dict
@@ -38,7 +38,7 @@ from aiida_feff.data.xasdata import XasData
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
 
-__all__ = ["plot_mu_e", "plot_chi_k", "plot_chi_r"]
+__all__ = ["plot_chi_k", "plot_chi_r"]
 
 
 def _require_matplotlib():
@@ -53,43 +53,6 @@ def _require_matplotlib():
 
 
 # ---------------------------------------------------------------------------
-# μ(E)
-# ---------------------------------------------------------------------------
-
-
-def plot_mu_e(
-    xas_data: XasData,
-    *,
-    ax=None,
-    label: str | None = None,
-    show_mu0: bool = False,
-    energy_offset: float = 0.0,
-) -> Figure:
-    """Plot the absorption spectrum μ(E)."""
-    plt = _require_matplotlib()
-
-    energy = xas_data.get_array("energy") + energy_offset
-    mu = xas_data.get_array("mu")
-
-    fig = None
-    if ax is None:
-        fig, ax = plt.subplots()
-
-    _label = label or (xas_data.label or f"pk={xas_data.pk}")
-    ax.plot(energy, mu, label=_label)
-
-    if show_mu0 and "mu0" in xas_data.get_arraynames():
-        ax.plot(energy, xas_data.get_array("mu0"), linestyle="--", label=f"{_label} μ₀")
-
-    ax.set_xlabel("Energy (eV)")
-    ax.set_ylabel("μ(E)")
-    ax.set_title("μ(E)")
-    ax.legend()
-
-    return t.cast("Figure", fig or ax.get_figure())
-
-
-# ---------------------------------------------------------------------------
 # χ(k) — k-space EXAFS
 # ---------------------------------------------------------------------------
 
@@ -101,6 +64,7 @@ def plot_chi_k(
     ax=None,
     label: str | None = None,
     plot_envelope: bool = False,
+    **plot_kwargs,
 ) -> Figure:
     """Plot k-weighted χ(k).
 
@@ -116,6 +80,11 @@ def plot_chi_k(
         Legend label.
     plot_envelope:
         If the node contains ``chi_k_std`` (ensemble average), shade ±1σ.
+    **plot_kwargs:
+        Forwarded to ``ax.plot`` (``color``, ``linestyle``, ``lw``, ``zorder``
+        …). Lets callers overlay several curves on one axis without
+        reimplementing the k-weighting and the axis labels, which is how the
+        examples used to end up with a second, untested copy of this code.
 
     Returns:
     -------
@@ -132,12 +101,14 @@ def plot_chi_k(
         fig, ax = plt.subplots()
 
     _label = label or (xas_data.label or f"pk={xas_data.pk}")
-    ax.plot(k, kw_chi, label=_label)
+    ax.plot(k, kw_chi, label=_label, **plot_kwargs)
 
     if plot_envelope and "chi_k_std" in xas_data.get_arraynames():
         std = xas_data.get_array("chi_k_std")
         kw_std = k**kweight * std
-        ax.fill_between(k, kw_chi - kw_std, kw_chi + kw_std, alpha=0.25)
+        # Match the line colour when the caller specified one.
+        shade = {"color": plot_kwargs["color"]} if "color" in plot_kwargs else {}
+        ax.fill_between(k, kw_chi - kw_std, kw_chi + kw_std, alpha=0.25, **shade)
 
     ax.set_xlabel("k (Å⁻¹)")
     ax.set_ylabel(f"k$^{{{kweight}}}$χ(k) (Å$^{{-{kweight}}}$)")
@@ -160,6 +131,7 @@ def plot_chi_r(
     ax=None,
     label: str | None = None,
     rmax: float | None = None,
+    **plot_kwargs,
 ) -> Figure:
     """Plot χ(R) from either an FT result node or an XasData node.
 
@@ -188,6 +160,8 @@ def plot_chi_r(
         Legend label.
     rmax:
         Clip the x-axis at this R value.
+    **plot_kwargs:
+        Forwarded to ``ax.plot``; see :func:`plot_chi_k`.
 
     Returns:
     -------
@@ -198,7 +172,17 @@ def plot_chi_r(
 
     # -- resolve r / chir arrays --------------------------------------------
     if isinstance(source, XasData):
-        r, chir_mag, chir_re, chir_im, resolved_ft = _xftf_inline(source, ft_params or {})
+        # No @calcfunction: a plot creates no provenance. The transform itself
+        # is larch.xftf_arrays, the same one chi_k_to_r runs, so a plot and a
+        # stored chi(R) cannot disagree about FT defaults.
+        from aiida_feff.calcfunctions.larch import xftf_arrays
+
+        result = xftf_arrays(source.get_array("k"), source.get_array("chi_k"), ft_params or {})
+        r = result["r"]
+        chir_mag = result["chir_mag"]
+        chir_re = result["chir_re"]
+        chir_im = result["chir_im"]
+        resolved_ft = result["ft_params"]
     elif isinstance(source, ArrayData):
         r = source.get_array("r")
         chir_mag = source.get_array("chir_mag")
@@ -222,7 +206,7 @@ def plot_chi_r(
 
     _label = label or (getattr(source, "label", None) or f"pk={source.pk}")
     mask = (r <= rmax) if rmax is not None else slice(None)
-    ax.plot(r[mask], y[mask], label=_label)
+    ax.plot(r[mask], y[mask], label=_label, **plot_kwargs)
 
     component_label = {"mag": "|χ(R)|", "re": "Re[χ(R)]", "im": "Im[χ(R)]"}[component]
     # χ(R) from a k^n-weighted transform carries units of Å^-(n+1), so the
@@ -239,21 +223,3 @@ def plot_chi_r(
 # ---------------------------------------------------------------------------
 # Internal: on-the-fly FT without provenance tracking
 # ---------------------------------------------------------------------------
-
-
-def _xftf_inline(xas_data: XasData, ft_params: dict):
-    """Fourier-transform without the @calcfunction wrapper (no AiiDA tracking).
-
-    Delegates to :func:`~aiida_feff.calcfunctions.larch.xftf_arrays` so a plot
-    and the provenance-tracked ``chi_k_to_r`` cannot disagree about FT defaults.
-    """
-    from aiida_feff.calcfunctions.larch import xftf_arrays
-
-    result = xftf_arrays(xas_data.get_array("k"), xas_data.get_array("chi_k"), ft_params)
-    return (
-        result["r"],
-        result["chir_mag"],
-        result["chir_re"],
-        result["chir_im"],
-        result["ft_params"],
-    )

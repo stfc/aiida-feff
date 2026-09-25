@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,12 +8,15 @@ version = "0.1.0a1"
 description = "AiiDA plugin for FEFF: provenance-tracked EXAFS calculations"
 authors = [{name = "J. Kane Shenton", email = "kane.shenton@stfc.ac.uk"}]
 readme = "README.md"
-license = {file = "LICENSE"}
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Framework :: AiiDA",
-    "License :: OSI Approved :: BSD 3-Clause License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Chemistry",
     "Topic :: Scientific/Engineering :: Physics",
 ]
@@ -26,6 +29,11 @@ dependencies = [
     "ase>=3.22",
     "xraylarch>=0.9.80",
     "h5py>=3.0",
+    # Capped: aiida-feff re-exports md-exafs' physics functions directly, so a
+    # minor release there changes this package's numerical output. The cap
+    # forces the bump to be a deliberate PR that runs the larch oracle tests
+    # before users see it.
+    "md-exafs>=0.3.0,<0.4",
 ]
 
 [project.optional-dependencies]
@@ -63,6 +71,7 @@ Tracker = "https://github.com/stfc/aiida-feff/issues"
 "feff.parameters"      = "aiida_feff.data.parameters:FeffParameters"
 "feff.xasdata"         = "aiida_feff.data.xasdata:XasData"
 "feff.pathcontributions" = "aiida_feff.data.pathcontributions:PathContributionsData"
+"feff.archive"         = "aiida_feff.data.archive:ExafsArchiveData"
 
 [project.entry-points."aiida.workflows"]
 "feff.ensemble" = "aiida_feff.workflows.ensemble:EnsembleExafsWorkChain"
@@ -119,7 +128,9 @@ max-statements = 100
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["D", "N806", "PLC0415", "B017", "E501", "PLR2004"]
-"examples/**/*.py" = ["D", "N806", "PLC0415", "E501", "PLR2004"]
+# Click commands accumulate one parameter per CLI option; that is the
+# shape of the library, not a design problem in the example.
+"examples/**/*.py" = ["D", "N806", "PLC0415", "E501", "PLR2004", "PLR0913"]
 "src/aiida_feff/calculations/_aggregate_paths.py" = ["SIM105"]
 "src/aiida_feff/data/pathcontributions.py" = ["SIM108"]
 
@@ -162,6 +173,18 @@ exclude = [
     "^examples/",
 ]
 show_error_codes = true
+
+[tool.uv]
+# pyFAI arrives through xraylarch and stopped publishing linux aarch64 wheels
+# after 2025.1.0. Without this bound, an arm64 machine (Apple Silicon, arm64
+# CI) builds its 94 Cython extension modules from source, which is slow and
+# exhausts the memory of a default container VM.
+#
+# Marker-gated, so x86_64 keeps tracking the current release. This is a
+# [tool.uv] constraint rather than a project dependency: it shapes resolution
+# here without appearing in the published package metadata, and it is
+# recorded in uv.lock so CI's --locked sync enforces it.
+constraint-dependencies = ["pyfai<2025.2 ; platform_machine == 'aarch64'"]
 
 [dependency-groups]
 dev = [

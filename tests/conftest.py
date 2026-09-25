@@ -264,7 +264,7 @@ def parse_retrieved(aiida_profile_clean):
     from aiida.orm import CalcJobNode, FolderData
     from aiida.plugins import ParserFactory
 
-    def _parse(entry_point_name, retrieved, inputs=None):
+    def _parse(entry_point_name, retrieved, inputs=None, ensemble_inputs=True):
         folder = FolderData()
         for filename, content in retrieved.items():
             data = content.encode() if isinstance(content, str) else content
@@ -274,9 +274,32 @@ def parse_retrieved(aiida_profile_clean):
         node = CalcJobNode()
         # Follow the entry point given, so this fixture can drive either parser.
         node.set_process_type(f"aiida.calculations:{entry_point_name}")
-        # Input links must be attached before the node is stored; the parser
-        # reads them to decide, for example, whether a run was potentials-only.
-        for label, input_node in (inputs or {}).items():
+
+        # site_idx and frame_idx carry port defaults, and structure /
+        # parameters are supplied by every generated (non-verbatim) run, so a
+        # real calcjob usually carries all four and FeffParser reads them to
+        # label the spectrum.  They are attached by default so the common shape
+        # is the one under test.
+        #
+        # ``ensemble_inputs=False`` gives the other shape that genuinely
+        # occurs: a run driven by a verbatim ``feff_input_file``, for which
+        # structure and parameters are absent (both ports are required=False
+        # and _validate_inputs accepts feff_input_file alone).
+        links = dict(inputs or {})
+        if entry_point_name == "feff.feff" and ensemble_inputs:
+            from aiida_feff.data.parameters import FeffParameters
+
+            structure = orm.StructureData(cell=[[2.87, 0, 0], [0, 2.87, 0], [0, 0, 2.87]])
+            structure.append_atom(position=(0.0, 0.0, 0.0), symbols="Fe")
+            links.setdefault("structure", structure)
+            links.setdefault("site_idx", orm.Int(0))
+            links.setdefault("frame_idx", orm.Int(0))
+            links.setdefault(
+                "parameters",
+                FeffParameters(dict={"edge": "K", "radius": 5.5, "absorbing_atom": 0}),
+            )
+
+        for label, input_node in links.items():
             stored = input_node if input_node.is_stored else input_node.store()
             node.base.links.add_incoming(stored, link_type=LinkType.INPUT_CALC, link_label=label)
         node.store()

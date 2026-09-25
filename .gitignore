@@ -27,3 +27,19 @@ htmlcov/
 # AiiDA
 .aiida/
 aiida.db
+
+# FEFF run output. examples/ execute in the working directory, so FEFF drops
+# log.dat, per-module logN.dat and its data files in the repository root.
+#
+# Anchored with a leading slash: unanchored patterns match at every level and
+# would also ignore tests/fixtures/aggregate_paths/, where files.dat and
+# feff0001.dat are irreplaceable golden fixtures. Already-tracked files would
+# survive, but a newly added fixture would be silently skipped.
+/log.dat
+/log[0-9]*.dat
+/feff.inp
+/xmu.dat
+/chi.dat
+/files.dat
+/paths.dat
+/feff[0-9][0-9][0-9][0-9].dat

@@ -24,7 +24,19 @@ FEFF_DATS = sorted(FIXTURE_DIR.glob("feff????.dat"))
 LARCH_ETOK = 0.26246842396479836
 
 
-@pytest.fixture(params=[p.name for p in FEFF_DATS[:3]])
+# Deliberately spans the path types rather than taking FEFF_DATS[:3], which
+# are three near-identical single-scattering Ti-O shells (nlegs=2, deg=1.0,
+# reff 1.86-1.94). Without a multiple-scattering path in the set, neither the
+# degeneracy factor nor FEFF's convention that reff is *half* the total path
+# length is exercised against the oracle at all.
+#
+#   feff0001  nlegs=2  deg=1.000  reff=1.8590   first Ti-O shell
+#   feff0007  nlegs=3  deg=2.000  reff=3.1969   multiple scattering
+#   feff0011  nlegs=2  deg=1.000  reff=3.3039   distant single scattering
+ORACLE_DATS = ["feff0001.dat", "feff0007.dat", "feff0011.dat"]
+
+
+@pytest.fixture(params=ORACLE_DATS)
 def feff_dat(request):
     """Path to one real Feff8L ``feff????.dat`` fixture."""
     return FIXTURE_DIR / request.param
@@ -165,3 +177,51 @@ class TestTotalChi:
     def test_frame_filter_selects_nothing_for_absent_frame(self, aggregated_node):
         k = np.linspace(3.0, 12.0, 50)
         np.testing.assert_allclose(total_chi(aggregated_node, k, frame_idx=999), np.zeros_like(k))
+
+
+class TestGroupPathsByKey:
+    """Grouping must use the same key function as the merge, or the two disagree."""
+
+    def test_groups_are_a_partition_of_the_paths(self, aggregated_node):
+        from aiida_feff.calcfunctions.exafs import group_paths_by_key
+
+        groups = group_paths_by_key(aggregated_node)
+        total = sum(len(paths) for paths in groups.values())
+        assert total == len(list(aggregated_node.iter_paths()))
+        assert groups, "no groups produced"
+
+    def test_keys_match_the_merge_key_function(self, aggregated_node):
+        """A different key here would silently split or merge shells."""
+        from aiida_feff.calcfunctions.exafs import group_paths_by_key
+        from aiida_feff.calcfunctions.path_contributions import make_path_key
+
+        groups = group_paths_by_key(aggregated_node, r_bin=0.15)
+        for key, paths in groups.items():
+            for path in paths:
+                assert make_path_key(path.scatterer, path.nlegs, path.r_eff, 0.15) == key
+
+    def test_a_coarser_bin_cannot_produce_more_groups(self, aggregated_node):
+        """Widening the r bin merges shells; it must never split them."""
+        from aiida_feff.calcfunctions.exafs import group_paths_by_key
+
+        fine = group_paths_by_key(aggregated_node, r_bin=0.05)
+        coarse = group_paths_by_key(aggregated_node, r_bin=1.0)
+        assert len(coarse) <= len(fine)
+
+
+class TestAbsorberElement:
+    """A wrong absorber index must fail loudly, not read as 'unknown'."""
+
+    def test_returns_the_symbol(self, generate_structure):
+        from aiida_feff.calculations.feff import absorber_element
+
+        assert absorber_element(generate_structure(), 0) == "Fe"
+
+    def test_out_of_range_index_raises(self, generate_structure):
+        """The symbol is written into path metadata, so a silent empty string
+        would later read as an unknown absorber in stored provenance."""
+        from aiida_feff.calculations.feff import absorber_element
+
+        structure = generate_structure()
+        with pytest.raises(ValueError, match="out of range"):
+            absorber_element(structure, len(structure.sites))

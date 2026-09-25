@@ -12,7 +12,6 @@ from aiida_feff.calculations.feff import (
     FEFF_CHI_FILE,
     FEFF_CONTRIBUTIONS_RAW,
     FEFF_LOG_FILE,
-    FEFF_XMUDA_FILE,
 )
 from aiida_feff.calculations.feff_batch import _snap_label
 from aiida_feff.parsers.feff import _parse_xas, excerpt_traceback
@@ -29,7 +28,7 @@ class FeffBatchParser(Parser):
     in the dynamic namespace ``path_contributions`` (when aggregation was
     requested and succeeded).
 
-    Partial failure is accepted: missing ``xmu.dat`` for a run is logged and
+    Partial failure is accepted: missing ``chi.dat`` for a run is logged and
     skipped.  The CalcJob is only marked failed if *no* outputs were produced
     at all.
     """
@@ -49,10 +48,24 @@ class FeffBatchParser(Parser):
         retrieved = self.retrieved
         top_names = retrieved.base.repository.list_object_names()
 
+        has_shard = "batch_shard.h5" in top_names
+        if has_shard:
+            from aiida_feff.data.archive import ExafsArchiveData
+
+            # as_path() materialises the object without pulling the whole shard
+            # into memory first; ExafsArchiveData copies it back into its own
+            # repository before the context exits.
+            with retrieved.base.repository.as_path("batch_shard.h5") as shard_path:
+                self.out("archive", ExafsArchiveData(file=str(shard_path)))
+
         # Collect all snap_* subdirectories present in the retrieved folder
         snap_dirs = sorted(n for n in top_names if n.startswith("snap_"))
 
         if not snap_dirs:
+            if has_shard:
+                # The shard is the authoritative output; per-snapshot directories
+                # are a legacy convenience, so their absence is not an error.
+                return ExitCode(0)
             self.logger.error(
                 "No snap_* directories found in retrieved folder; "
                 "the driver may have failed entirely. Check batch_err.log."
@@ -77,18 +90,13 @@ class FeffBatchParser(Parser):
             label = _snap_label(frame_idx, site_idx)
             files_in_dir = retrieved.base.repository.list_object_names(snap_dir)
 
-            if FEFF_XMUDA_FILE not in files_in_dir:
-                self.logger.warning("%s: xmu.dat missing; run likely failed", snap_dir)
+            if FEFF_CHI_FILE not in files_in_dir:
+                self.logger.warning("%s: chi.dat missing; run likely failed", snap_dir)
                 continue
 
-            xmu_bytes = retrieved.base.repository.get_object_content(
-                f"{snap_dir}/{FEFF_XMUDA_FILE}", mode="rb"
+            chi_bytes = retrieved.base.repository.get_object_content(
+                f"{snap_dir}/{FEFF_CHI_FILE}", mode="rb"
             )
-            chi_bytes: bytes | None = None
-            if FEFF_CHI_FILE in files_in_dir:
-                chi_bytes = retrieved.base.repository.get_object_content(
-                    f"{snap_dir}/{FEFF_CHI_FILE}", mode="rb"
-                )
 
             # Every run in a batch uses the same binary, so the banner is read
             # once from whichever snapshot supplies it first.
@@ -98,10 +106,18 @@ class FeffBatchParser(Parser):
                 )
                 feff_version = parse_feff_version(log_text.decode("utf-8", errors="replace"))
 
-            xas = _parse_xas(xmu_bytes, chi_bytes, logger=self.logger, feff_version=feff_version)
+            xas = _parse_xas(chi_bytes, logger=self.logger, feff_version=feff_version)
             if xas is None:
                 self.logger.warning("%s: XAS parsing returned None; skipping", snap_dir)
                 continue
+
+            # Same labelling FeffParser puts on a serial run, so a XasData node
+            # says where it came from whichever route produced it.  No
+            # absorber_element here: the driver already wrote it into the
+            # shard, and recovering it would mean re-slicing the trajectory
+            # once per snapshot.
+            xas.base.attributes.set("frame_index", frame_idx)
+            xas.base.attributes.set("site_index", site_idx)
 
             self.out(f"xas_data.{label}", xas)
             n_ok += 1
@@ -110,7 +126,7 @@ class FeffBatchParser(Parser):
                 self._parse_path_contributions(snap_dir, label)
 
         if n_ok == 0:
-            self.logger.error("All %d runs failed to produce xmu.dat", len(snap_dirs))
+            self.logger.error("All %d runs failed to produce chi.dat", len(snap_dirs))
             return self.exit_codes.ERROR_ALL_RUNS_FAILED  # type: ignore[no-any-return]
 
         self.logger.info("Batch parse complete: %d/%d runs produced XasData", n_ok, len(snap_dirs))

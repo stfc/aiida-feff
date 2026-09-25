@@ -1,16 +1,21 @@
 {
   "name": "aiida-feff dev",
+  // Podman users: append "docker-compose.podman.yml" to this list. It carries
+  // `userns_mode: keep-id`, which Docker Engine rejects, so it cannot live in
+  // the base file without breaking every Docker user. See that file and
+  // README.md ("Development environment").
   "dockerComposeFile": "docker-compose.yml",
   "service": "app",
   "workspaceFolder": "/workspace",
-
   "features": {
     "ghcr.io/devcontainers/features/common-utils:2": {
       "installZsh": true,
       "configureZshAsDefaultShell": true
     }
   },
-
+  // UV_PROJECT_ENVIRONMENT and UV_LINK_MODE are set in docker-compose.yml
+  // rather than here, so they apply to every process in the service and not
+  // only to what VS Code starts.
   "customizations": {
     "vscode": {
       "extensions": [
@@ -20,18 +25,36 @@
         "tamasfe.even-better-toml"
       ],
       "settings": {
-        "python.defaultInterpreterPath": "/workspace/.venv/bin/python",
+        "python.defaultInterpreterPath": "/home/vscode/.venv/bin/python",
         "python.testing.pytestEnabled": true,
         "python.testing.pytestArgs": ["tests"]
       }
     }
   },
-
+  // GitHub Codespaces sizing. The default 2-core/8GB machine works; this
+  // states the floor so a 2GB machine is refused up front rather than dying
+  // partway through `uv sync`.
+  "hostRequirements": {
+    "cpus": 2,
+    "memory": "8gb",
+    "storage": "32gb"
+  },
   "postCreateCommand": "bash .devcontainer/post-create.sh",
-
+  // The daemon does not survive a container stop/start. Without this,
+  // submitted processes sit in 'created' forever with no obvious cause.
+  "postStartCommand": "uv run verdi daemon start 2 || true",
   "remoteUser": "vscode",
-  "updateRemoteUserUID": false,
-
+  // Remap vscode to the UID that owns the workspace on the host. The bind
+  // mount carries host ownership on Linux, and vscode is 1000, so anywhere
+  // the host user is not 1000 the workspace is read-only to the container:
+  // the editable install cannot write src/aiida_feff.egg-info, pre-commit
+  // cannot write .git/hooks, and pytest cannot write .pytest_cache. The CI
+  // runner owns its checkout as 1001, which is exactly that case.
+  //
+  // This is the spec default, and chowning /workspace instead is the trap
+  // described in post-create.sh. No-op on macOS and Windows, where bind
+  // mounts do not carry host UIDs, and on any host already running as 1000.
+  "updateRemoteUserUID": true,
   "forwardPorts": [8888],
   "portsAttributes": {
     "8888": { "label": "Jupyter" }

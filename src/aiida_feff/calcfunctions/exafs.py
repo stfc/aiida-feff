@@ -35,105 +35,12 @@ from __future__ import annotations
 from collections import defaultdict
 
 import numpy as np
+from md_exafs.paths import path_chi
 
-from aiida_feff.constants import ETOK
 from aiida_feff.data.pathcontributions import (
-    FEFF_DATA_COLS,
     PathContributionsData,
     PathResult,
 )
-
-_COL = {name: i for i, name in enumerate(FEFF_DATA_COLS)}
-
-
-def _resample(k_native: np.ndarray, values: np.ndarray, q: np.ndarray) -> np.ndarray:
-    """Interpolate a ``feff????.dat`` column onto the shifted wavenumber grid.
-
-    Cubic, matching larch's ``UnivariateSpline(..., s=0)``: FEFF's native grid
-    has 0.1 Å⁻¹ spacing, coarse enough that linear interpolation visibly
-    distorts χ(k) near its zero crossings.  Falls back to linear when there
-    are too few points for a cubic spline.
-    """
-    min_points_for_cubic = 4
-    if len(k_native) < min_points_for_cubic:
-        return np.asarray(np.interp(q, k_native, values), dtype=float)
-    from scipy.interpolate import UnivariateSpline
-
-    return np.asarray(UnivariateSpline(k_native, values, s=0)(q), dtype=float)
-
-
-def path_chi(
-    k_native: np.ndarray,
-    feff_data: np.ndarray,
-    r_eff: float,
-    degeneracy: float,
-    k_out: np.ndarray,
-    *,
-    sigma2: float = 0.0,
-    s02: float = 1.0,
-    e0_shift: float = 0.0,
-    deltar: float = 0.0,
-) -> np.ndarray:
-    """Evaluate one scattering path's χ(k) on *k_out*.
-
-    Args:
-        k_native: The path's own k grid (``PathResult.k``), Å⁻¹.
-        feff_data: ``(M, 6)`` array with columns :data:`FEFF_DATA_COLS`.
-        r_eff: Effective path length in Å — half the total path length for
-            multiple-scattering paths, per FEFF's convention.
-        degeneracy: Path degeneracy N as reported by FEFF.
-        k_out: Output wavenumber grid, Å⁻¹.
-        sigma2: Debye–Waller factor σ² in Å² (a variance, not σ).
-        s02: Amplitude reduction factor S₀².
-        e0_shift: ΔE₀ in eV.  Positive shifts theory to lower k.
-        deltar: ΔR in Å, added to ``r_eff``.
-
-    Returns:
-        χ(k) on ``k_out``.  Points below the shifted threshold are zero.
-    """
-    k_out = np.asarray(k_out, dtype=float)
-    feff_data = np.asarray(feff_data, dtype=float)
-    if feff_data.shape[1] != len(FEFF_DATA_COLS):
-        raise ValueError(
-            f"feff_data must have {len(FEFF_DATA_COLS)} columns "
-            f"{FEFF_DATA_COLS}, got shape {feff_data.shape}."
-        )
-    if r_eff <= 0:
-        raise ValueError(f"r_eff must be > 0, got {r_eff}")
-
-    # E0-shifted wavenumber q.  Below the shifted threshold the energy is
-    # negative; larch keeps the sign, which makes the transform continuous.
-    energy = k_out**2 - float(e0_shift) * ETOK
-    q = np.sign(energy) * np.sqrt(np.abs(energy))
-
-    k_native = np.asarray(k_native, dtype=float)
-    amp = _resample(k_native, feff_data[:, _COL["mag_feff"]] * feff_data[:, _COL["red_fact"]], q)
-    pha = _resample(k_native, feff_data[:, _COL["real_phc"]] + feff_data[:, _COL["pha_feff"]], q)
-    rep = _resample(k_native, feff_data[:, _COL["rep"]], q)
-    lam = _resample(k_native, feff_data[:, _COL["lam"]], q)
-
-    reff = float(r_eff)
-    p_sq = (rep + 1j / lam) ** 2
-    p = np.sqrt(p_sq)
-
-    cchi = np.exp(
-        -2 * reff * p.imag
-        - 2 * p_sq * sigma2
-        + 1j * (2 * q * reff + pha + 2 * p * (deltar - 2 * sigma2 / reff))
-    )
-    with np.errstate(divide="ignore", invalid="ignore"):
-        cchi = degeneracy * float(s02) * amp * cchi / (q * (reff + deltar) ** 2)
-
-    chi = np.asarray(cchi.imag, dtype=float)
-    chi[~np.isfinite(chi)] = 0.0
-    # At k = 0 the 1/q prefactor is singular, and once E0 is shifted the
-    # lookup there also falls outside the tabulated k range.  larch replaces
-    # the point by linear extrapolation from its neighbours; matching that
-    # keeps the two implementations comparable point for point.
-    min_points_for_extrapolation = 3
-    if len(chi) >= min_points_for_extrapolation and k_out[0] == 0.0:
-        chi[0] = 2 * chi[1] - chi[2]
-    return chi
 
 
 def path_result_chi(path: PathResult, k_out: np.ndarray, **kwargs) -> np.ndarray:
@@ -165,8 +72,8 @@ def total_chi(
         k_out: Output wavenumber grid, Å⁻¹.
         sigma2: Either one σ² applied to every path, or a mapping from
             ``scatterer`` to σ² (Å²) — e.g. the output of
-            :func:`~aiida_feff.calcfunctions.debye_waller.compute_msrd`
-            re-keyed by path type.
+            :func:`md_exafs.debye_waller.calculate_grouped_msrd` re-keyed by
+            path type.
         s02: Amplitude reduction factor.
         e0_shift: ΔE₀ in eV.
         frame_idx: Restrict to one MD frame (merged nodes only).

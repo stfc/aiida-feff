@@ -15,13 +15,20 @@ Workflow
 5. Launch one :class:`~aiida_feff.calculations.feff.FeffCalculation` per
    ``(frame, site)`` pair (fan-out: N_frames x N_sites jobs).
 6. Wait for all children to finish.
-7. Call :func:`~aiida_feff.calcfunctions.larch.average_xas_data` to
-   produce per-site and overall ensemble-averaged
-   :class:`~aiida_feff.data.xasdata.XasData` outputs.
+7. Consolidate every χ(k) into one :class:`~aiida_feff.data.archive.ExafsArchiveData`
+   with :func:`~aiida_feff.calcfunctions.archive.merge_exafs_shards`, then
+   project the averages it holds into ``averaged_xas`` with
+   :func:`~aiida_feff.calcfunctions.larch.archive_to_averaged_xas`.
+
+The batch route gets its shards from the remote driver and the serial route
+builds one with :func:`~aiida_feff.calcfunctions.archive.create_serial_shard`,
+so both end at the same merge and the ensemble average has a single
+implementation (ADR 0004).
 
 Multi-site outputs
 ------------------
-``averaged_xas.site_NNNN``  per-site average (one per absorber site index)
+``archive``                 consolidated ensemble HDF5; the node to read
+``averaged_xas.site_NNNN``  per-site average, projected from ``archive``
 ``averaged_xas.all``        grand average over all sites and all frames
 ``path_contributions``      merged HDF5; filter by ``site_idx`` column post-hoc
 
@@ -41,10 +48,12 @@ from aiida import orm
 from aiida.engine import ToContext, WorkChain, if_
 from aiida.engine.processes.ports import PORT_NAMESPACE_SEPARATOR
 
-from aiida_feff.calcfunctions.larch import average_xas_data
+from aiida_feff.calcfunctions.archive import create_serial_shard, merge_exafs_shards
+from aiida_feff.calcfunctions.larch import archive_to_averaged_xas
 from aiida_feff.calcfunctions.path_contributions import merge_path_contributions
 from aiida_feff.calculations.feff import CONTROL_NO_POT, CONTROL_POT_ONLY, FeffCalculation
 from aiida_feff.calculations.feff_batch import FeffBatchCalculation, _snap_label
+from aiida_feff.data.archive import ExafsArchiveData
 from aiida_feff.data.parameters import FeffParameters
 from aiida_feff.data.pathcontributions import PathContributionsData
 from aiida_feff.data.xasdata import XasData
@@ -62,11 +71,48 @@ logger = logging.getLogger(__name__)
 _LARGE_N_SITES = 20
 
 
+def _reject_negative_indices(spec: int | str | list) -> None:
+    """Raise if an absorber spec contains a negative absolute index.
+
+    md-exafs resolves negative indices with Python semantics, which is convenient
+    on a command line but wrong for a provenance-tracked input: the stored spec
+    would no longer identify the site that was computed.
+    """
+    if isinstance(spec, bool):
+        raise ValueError(f"absorbing_atoms must be int, str, or list[int]; got {type(spec)}")
+    if isinstance(spec, int):
+        candidates: list[int] = [spec]
+    elif isinstance(spec, list | tuple):
+        candidates = [int(x) for x in spec]
+    elif isinstance(spec, str) and ":" not in spec:
+        parts = [part.strip() for part in spec.split(",") if part.strip()]
+        try:
+            # Only an all-integer spec is an index list; anything else is an
+            # element symbol and has no indices to check.
+            candidates = [int(part) for part in parts]
+        except ValueError:
+            candidates = []
+    else:
+        candidates = []
+
+    negative = [i for i in candidates if i < 0]
+    if negative:
+        raise ValueError(
+            f"Absorber indices must be non-negative; got {negative}. "
+            "Negative (Python-style) indexing is rejected because the stored "
+            "input would not identify the site that was computed."
+        )
+
+
 def _resolve_absorber_sites(
     structure: orm.StructureData,
     spec: int | str | list,
 ) -> list[int]:
     """Resolve absorber specification to a validated list of 0-based atom indices.
+
+    Delegates the resolution itself to :func:`md_exafs.resolve_frame_absorbers`
+    (ADR 0008) so that the plugin and the core engine agree on what a given
+    specification means.
 
     Accepted formats (all validated to be single-species):
 
@@ -75,7 +121,11 @@ def _resolve_absorber_sites(
     - ``"Cu"``           -- element symbol → all matching indices
     - ``"0,1,2"``        -- comma-separated absolute indices as a string
     - ``"Cu:0,1"``       -- element symbol + relative indices within that element
-                           (e.g. ``"Cu:0,1"`` → 1st and 2nd Cu atoms)
+                            (e.g. ``"Cu:0,1"`` → 1st and 2nd Cu atoms)
+
+    Unlike bare md-exafs, **negative indices are rejected**.  The specification is
+    stored verbatim in the provenance graph, so ``-1`` would record an input that
+    does not match the site actually computed.
 
     Parameters
     ----------
@@ -92,72 +142,16 @@ def _resolve_absorber_sites(
     Raises:
     ------
     ValueError
-        If indices are out of range, empty, the spec is ambiguous, or
-        the selected atoms belong to more than one element.
+        If indices are negative or out of range, the spec is empty or ambiguous,
+        or the selected atoms belong to more than one element.
     """
+    from md_exafs.selection import resolve_frame_absorbers
+
+    _reject_negative_indices(spec)
+
     pmg_structure = structure.get_pymatgen_structure()
     symbols = [site.species_string for site in pmg_structure.sites]
-    n = len(symbols)
-
-    if isinstance(spec, int):
-        indices = [spec]
-
-    elif isinstance(spec, list):
-        if not spec:
-            raise ValueError("absorbing_atoms list must not be empty.")
-        indices = [int(x) for x in spec]
-
-    elif isinstance(spec, str):
-        spec = spec.strip()
-
-        if ":" in spec:
-            # "Cu:0,1" — relative indices within the element's sites
-            element_part, idx_part = spec.split(":", 1)
-            element = element_part.strip().capitalize()
-            element_indices = [i for i, s in enumerate(symbols) if s == element]
-            if not element_indices:
-                raise ValueError(f"No atoms with element {element!r} found in structure.")
-            try:
-                rel = [int(x.strip()) for x in idx_part.split(",")]
-            except ValueError as exc:
-                raise ValueError(
-                    f"Invalid absorber format {spec!r}. "
-                    "Use 'Element:rel0,rel1' with integer relative indices."
-                ) from exc
-            bad_rel = [r for r in rel if not 0 <= r < len(element_indices)]
-            if bad_rel:
-                raise ValueError(
-                    f"Relative indices {bad_rel} out of range for element {element!r} "
-                    f"(0–{len(element_indices) - 1})."
-                )
-            indices = [element_indices[r] for r in rel]
-
-        elif spec.replace(",", "").replace(" ", "").isdigit():
-            # "0,1,2" — comma-separated absolute indices
-            indices = [int(x.strip()) for x in spec.split(",")]
-
-        else:
-            # Element symbol → all matching sites
-            element = spec.capitalize()
-            indices = [i for i, s in enumerate(symbols) if s == element]
-            if not indices:
-                raise ValueError(f"No atoms with element {element!r} found in structure.")
-
-    else:
-        raise ValueError(f"absorbing_atoms must be int, str, or list[int]; got {type(spec)}")
-
-    for idx in indices:
-        if not 0 <= idx < n:
-            raise ValueError(f"Absorber index {idx} out of range (0–{n - 1}).")
-
-    # Single-species check
-    element = symbols[indices[0]]
-    bad = [idx for idx in indices if symbols[idx] != element]
-    if bad:
-        raise ValueError(
-            f"All absorber indices must be the same element ({element!r}). "
-            f"Indices {bad} are {[symbols[i] for i in bad]}."
-        )
+    indices = resolve_frame_absorbers(symbols, spec)
 
     if len(indices) > _LARGE_N_SITES:
         logger.warning(
@@ -391,6 +385,20 @@ class EnsembleExafsWorkChain(WorkChain):
                 "at runtime if not set."
             ),
         )
+        spec.input(
+            "clean_scratch",
+            valid_type=orm.Bool,
+            default=lambda: orm.Bool(False),
+            help=(
+                "When using batch mode, delete successful snapshot scratch directories on the fly."
+            ),
+        )
+        spec.input(
+            "stream_chunk_size",
+            valid_type=orm.Int,
+            required=False,
+            help="Streaming chunk size for batch mode to bound peak disk and inode usage.",
+        )
 
         spec.output_namespace(
             "averaged_xas",
@@ -408,6 +416,12 @@ class EnsembleExafsWorkChain(WorkChain):
             required=False,
             help="Merged per-path FEFF data from all successful snapshots.",
         )
+        spec.output(
+            "archive",
+            valid_type=ExafsArchiveData,
+            required=False,
+            help="Consolidated ensemble archive containing averaged spectra and paths (ADR 0004).",
+        )
 
         spec.exit_code(300, "ERROR_ALL_FAILED", message="All snapshot FEFF calculations failed.")
         spec.exit_code(
@@ -424,6 +438,14 @@ class EnsembleExafsWorkChain(WorkChain):
             303,
             "ERROR_MISSING_AGGREGATION_CODE",
             message="batch_size requires python_code to be set (used as Python runner).",
+        )
+        spec.exit_code(
+            304,
+            "ERROR_NO_ARCHIVE",
+            message=(
+                "{n_ok} snapshot spectra were produced but no shard reached "
+                "merge_exafs_shards, so there is no ensemble archive and no averaged_xas."
+            ),
         )
 
         # aiida-core types outline steps as ``Callable[[WorkChain], ...]``, which
@@ -499,6 +521,8 @@ class EnsembleExafsWorkChain(WorkChain):
         else:
             site_indices = [int(params_dict.get("absorbing_atom", 0))]
         self.ctx.site_indices = site_indices
+        self.ctx.initial_site_indices = list(site_indices)
+        self.ctx.n_failed_precompute = 0
         self.report(f"Absorber site indices: {site_indices}")
 
     def should_precompute(self) -> bool:
@@ -575,11 +599,17 @@ class EnsembleExafsWorkChain(WorkChain):
         """Check each potentials run and build ctx.pot_remote[site_idx → RemoteData].
 
         The parser recognises a potentials-only CONTROL card and returns 0 when
-        ``xmu.dat`` is legitimately absent, so only exit status 0 is accepted
-        here.  Treating 310 as acceptable — as this used to — let a genuinely
-        crashed FEFF supply the potentials for every downstream job.
+        ``chi.dat`` is legitimately absent, so only exit status 0 is accepted
+        here.
+
+        Potentials are precomputed per absorber site and are independent of one another.
+        If all sites fail, the workchain aborts with ERROR_POTENTIALS_FAILED.
+        If a subset of sites fail, they are logged and dropped, and the remaining
+        usable sites continue.
         """
         pot_remote: dict[int, orm.RemoteData] = {}
+        usable_sites: list[int] = []
+        failed_sites: list[int] = []
 
         for site_idx in self.ctx.site_indices:
             label = f"pot_site_{site_idx:04d}"
@@ -589,15 +619,32 @@ class EnsembleExafsWorkChain(WorkChain):
                     f"Potentials run for site {site_idx} ({child.pk}) failed "
                     f"with exit status {child.exit_status}."
                 )
-                return self.exit_codes.ERROR_POTENTIALS_FAILED.format(  # type: ignore[no-any-return]
-                    site_idx=site_idx
+                failed_sites.append(site_idx)
+            else:
+                pot_remote[site_idx] = child.outputs.remote_folder
+                usable_sites.append(site_idx)
+                self.report(
+                    f"Potentials for site {site_idx} ready "
+                    f"(remote pk={child.outputs.remote_folder.pk})."
                 )
-            pot_remote[site_idx] = child.outputs.remote_folder
-            self.report(
-                f"Potentials for site {site_idx} ready "
-                f"(remote pk={child.outputs.remote_folder.pk})."
+
+        if not usable_sites:
+            self.report("All potential pre-computation runs failed.")
+            return self.exit_codes.ERROR_POTENTIALS_FAILED.format(  # type: ignore[no-any-return]
+                site_idx=failed_sites[0] if len(failed_sites) == 1 else failed_sites
             )
 
+        if failed_sites:
+            self.report(
+                f"Potential precomputation failed for {len(failed_sites)} of "
+                f"{len(self.ctx.site_indices)} sites: {failed_sites}. "
+                "These sites will be skipped; continuing with remaining sites."
+            )
+            self.ctx.n_failed_precompute = len(failed_sites) * len(self.ctx.structures)
+        else:
+            self.ctx.n_failed_precompute = 0
+
+        self.ctx.site_indices = usable_sites
         self.ctx.pot_remote = pot_remote
 
     def submit_batch_calculations(self):
@@ -620,7 +667,8 @@ class EnsembleExafsWorkChain(WorkChain):
                 job_pairs.append((i, site_idx))
 
         self.ctx.job_pairs = job_pairs
-        self.ctx.n_total = len(job_pairs)
+        initial_sites = getattr(self.ctx, "initial_site_indices", self.ctx.site_indices)
+        self.ctx.n_total = len(self.ctx.structures) * len(initial_sites)
 
         # Convert the structures we will actually use into a single TrajectoryData.
         # The batch CalcJob receives frame indices into this packed trajectory, so
@@ -658,6 +706,10 @@ class EnsembleExafsWorkChain(WorkChain):
             }
             if "n_workers" in self.inputs:
                 batch_inputs["n_workers"] = self.inputs.n_workers
+            if "clean_scratch" in self.inputs:
+                batch_inputs["clean_scratch"] = self.inputs.clean_scratch
+            if "stream_chunk_size" in self.inputs:
+                batch_inputs["stream_chunk_size"] = self.inputs.stream_chunk_size
             if use_precomputed:
                 batch_inputs["remote_potentials"] = {
                     f"site_{k:04d}": v for k, v in self.ctx.pot_remote.items()
@@ -677,6 +729,7 @@ class EnsembleExafsWorkChain(WorkChain):
         per_site: dict[int, dict[str, XasData]] = {s: {} for s in self.ctx.site_indices}
         all_xas: dict[str, XasData] = {}
         successful_paths: dict[str, PathContributionsData] = {}
+        shards: dict[str, ExafsArchiveData] = {}
         n_failed = 0
 
         for batch_label, chunk in self.ctx.batch_chunks.items():
@@ -694,6 +747,14 @@ class EnsembleExafsWorkChain(WorkChain):
             # each namespace once rather than once per pair.
             child_xas = dynamic_outputs(child, "xas_data")
             child_paths = dynamic_outputs(child, "path_contributions")
+
+            if "archive" in child.outputs:
+                shards[batch_label] = child.outputs.archive
+            else:
+                self.report(
+                    f"{batch_label} ({child.pk}) produced no batch_shard.h5; the "
+                    "consolidated 'archive' output will be incomplete."
+                )
 
             for frame_idx, site_idx in chunk:
                 label = _snap_label(frame_idx, site_idx)
@@ -715,7 +776,8 @@ class EnsembleExafsWorkChain(WorkChain):
         self.ctx.per_site_xas = per_site
         self.ctx.all_xas = all_xas
         self.ctx.successful_paths = successful_paths
-        self.ctx.n_failed = n_failed
+        self.ctx.n_failed = n_failed + getattr(self.ctx, "n_failed_precompute", 0)
+        self.ctx.shards = shards
 
     def submit_feff_calculations(self):
         """Fan out: submit one FeffCalculation per (frame, site) pair."""
@@ -767,7 +829,8 @@ class EnsembleExafsWorkChain(WorkChain):
                 )
 
         self.ctx.job_pairs = job_pairs
-        self.ctx.n_total = len(job_pairs)
+        initial_sites = getattr(self.ctx, "initial_site_indices", self.ctx.site_indices)
+        self.ctx.n_total = len(self.ctx.structures) * len(initial_sites)
         return ToContext(**calcs)  # type: ignore[arg-type]
 
     def inspect_results(self) -> None:
@@ -801,7 +864,27 @@ class EnsembleExafsWorkChain(WorkChain):
         self.ctx.per_site_xas = per_site
         self.ctx.all_xas = all_xas
         self.ctx.successful_paths = successful_paths
-        self.ctx.n_failed = n_failed
+        self.ctx.n_failed = n_failed + getattr(self.ctx, "n_failed_precompute", 0)
+
+        # Serial path writes a shard via BatchShardWriter so merge_shards runs
+        # on both paths and the archive always exists (Decision 4 / ADR 0004).
+        if all_xas:
+            shard_inputs: dict[str, t.Any] = {}
+            for label, xas_node in all_xas.items():
+                shard_inputs[f"xas__{label}"] = xas_node
+            for label, pc_node in successful_paths.items():
+                shard_inputs[f"paths__{label}"] = pc_node
+
+            serial_shard = create_serial_shard(
+                metadata={
+                    "call_link_label": "create_serial_shard",
+                    "label": "serial_batch_shard",
+                },
+                **shard_inputs,
+            )
+            self.ctx.shards = {"serial_shard": serial_shard}
+        else:
+            self.ctx.shards = {}
 
     def average_results(self) -> None:
         """Produce per-site and grand-average XasData outputs."""
@@ -814,26 +897,6 @@ class EnsembleExafsWorkChain(WorkChain):
             self.report("All snapshot calculations failed.")
             return self.exit_codes.ERROR_ALL_FAILED  # type: ignore[no-any-return]
 
-        # Per-site averages
-        for site_idx, xas_dict in self.ctx.per_site_xas.items():
-            if not xas_dict:
-                continue
-            averaged = average_xas_data(
-                metadata={
-                    "call_link_label": f"average_xas_site_{site_idx:04d}",
-                    "label": f"ensemble_average_site_{site_idx:04d}",
-                },
-                **xas_dict,
-            )
-            self.out(f"averaged_xas.site_{site_idx:04d}", averaged)
-
-        # Grand average over all sites and frames
-        grand_avg = average_xas_data(
-            metadata={"call_link_label": "average_xas_all", "label": "ensemble_average_all"},
-            **self.ctx.all_xas,
-        )
-        self.out("averaged_xas.all", grand_avg)
-
         self.out("n_failed", orm.Int(n_failed).store())
 
         if self.inputs.path_cw_threshold.value >= 0 and self.ctx.successful_paths:
@@ -843,6 +906,48 @@ class EnsembleExafsWorkChain(WorkChain):
                 **self.ctx.successful_paths,
             )
             self.out("path_contributions", merged)
+
+        # Consolidate shards into one ensemble archive (ADR 0004).
+        # Written on both batch and serial paths.
+        #
+        # There being no shard at all, with spectra in hand, is a failure and
+        # not a quiet omission.  ``averaged_xas`` is a required output, but it
+        # is a dynamic namespace with no declared children, so plumpy's
+        # required-output check passes on an empty one and the workchain would
+        # otherwise finish at exit 0 having produced no ensemble average --
+        # the batch driver swallowing an md-exafs ImportError, and retrieval
+        # tolerating the missing batch_shard.h5, both land here.
+        if not self.ctx.shards:
+            self.report(
+                f"No shard reached merge_exafs_shards though {n_ok} snapshots produced "
+                "spectra; there is no ensemble archive to average."
+            )
+            return self.exit_codes.ERROR_NO_ARCHIVE.format(n_ok=n_ok)  # type: ignore[no-any-return]
+
+        ensemble_archive = merge_exafs_shards(
+            metadata={
+                "call_link_label": "merge_shards",
+                "label": "ensemble_archive",
+            },
+            **self.ctx.shards,
+        )
+        self.out("archive", ensemble_archive)
+
+        # The averaged_xas outputs are a projection of the archive, not a
+        # second average over the per-snapshot nodes, so there is one
+        # ensemble average in the graph and one place it can be wrong.
+        averaged_nodes = archive_to_averaged_xas(
+            ensemble_archive,
+            # AiiDA injects metadata into every calcfunction; the signature
+            # stays narrow so a stray keyword cannot become a silent,
+            # ignored provenance input.
+            metadata={  # type: ignore[call-arg]
+                "call_link_label": "project_averaged_xas",
+                "label": "projected_averaged_xas",
+            },
+        )
+        for key, xas_node in averaged_nodes.items():
+            self.out(f"averaged_xas.{key}", xas_node)
 
         if "group_label" in self.inputs:
             label = self.inputs.group_label.value

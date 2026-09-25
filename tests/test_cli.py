@@ -24,7 +24,7 @@ class TestExport:
         assert "RPATH" in result.output
 
     def test_writes_to_a_file(self, runner, tmp_path, aiida_profile_clean):
-        node = FeffParameters(dict={"edge": "K"}).store()
+        node = FeffParameters(dict={"edge": "K", "radius": 5.5}).store()
         target = tmp_path / "feff.inp"
         result = runner.invoke(cmd_export, [str(node.pk), "-o", str(target)])
         assert result.exit_code == 0, result.output
@@ -42,12 +42,12 @@ class TestShow:
         result = runner.invoke(cmd_show, [str(node.pk)])
         assert result.exit_code == 0, result.output
         assert "chi_k" in result.output
-        assert "7112" in result.output
+        assert "k" in result.output
 
 
 class TestList:
     def test_lists_both_types(self, runner, generate_xas_data, aiida_profile_clean):
-        FeffParameters(dict={"edge": "K"}).store()
+        FeffParameters(dict={"edge": "K", "radius": 5.5}).store()
         generate_xas_data().store()
         result = runner.invoke(cmd_list, [])
         assert result.exit_code == 0, result.output
@@ -55,7 +55,7 @@ class TestList:
         assert "XasData" in result.output
 
     def test_type_filter(self, runner, generate_xas_data, aiida_profile_clean):
-        FeffParameters(dict={"edge": "K"}).store()
+        FeffParameters(dict={"edge": "K", "radius": 5.5}).store()
         generate_xas_data().store()
         result = runner.invoke(cmd_list, ["--type", "parameters"])
         assert "FeffParameters" in result.output
@@ -63,7 +63,7 @@ class TestList:
 
     def test_limit_is_respected(self, runner, aiida_profile_clean):
         for _ in range(5):
-            FeffParameters(dict={"edge": "K"}).store()
+            FeffParameters(dict={"edge": "K", "radius": 5.5}).store()
         result = runner.invoke(cmd_list, ["--type", "parameters", "--limit", "2"])
         assert result.output.count("FeffParameters") == 2
 

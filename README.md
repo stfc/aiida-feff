@@ -18,14 +18,14 @@ including ensemble averaging over MD snapshots via
 | Component | Description |
 |-----------|-------------|
 | `FeffCalculation` | CalcJob wrapping a single FEFF run; builds `feff.inp` from `StructureData` + `FeffParameters` |
-| `FeffParser` | Parses `xmu.dat` and `chi.dat` into `XasData` output nodes |
+| `FeffParser` | Parses `chi.dat` into `XasData` output nodes |
 | `FeffBatchCalculation` | CalcJob that runs *N* FEFF instances in one Slurm job (one per core); for HPC ensemble runs |
 | `FeffBatchParser` | Parses all per-snapshot outputs from a batch job into a dynamic namespace of `XasData` nodes |
 | `FeffParameters` | Validated `Dict` subclass for FEFF control cards |
-| `XasData` | `ArrayData` subclass storing μ(E) and χ(k) spectra |
-| `EnsembleExafsWorkChain` | Fan-out over MD snapshots → ensemble-averaged χ(k); supports both single-job and batch modes |
-| `calcfunctions` | Larch post-processing (FT), and Debye-Waller extraction |
-| `visualise` | Matplotlib helpers for μ(E), χ(k), and χ(R) plots |
+| `XasData` | `ArrayData` subclass storing χ(k), plus μ(E) on experimental imports |
+| `EnsembleExafsWorkChain` | Fan-out over MD snapshots → one `ExafsArchiveData` and ensemble-averaged χ(k); single-job and batch modes |
+| `calcfunctions` | Larch post-processing (FT), archive projection, experimental imports |
+| `visualise` | Matplotlib helpers for χ(k) and χ(R) plots |
 
 ## Installation
 
@@ -101,9 +101,56 @@ print(f"chi(k) shape: {xas.chi_k.shape}")
 
 ### 3. Ensemble EXAFS from an MD trajectory (localhost / dev)
 
-> **Recommended Environment:** Running these examples requires AiiDA services (PostgreSQL, RabbitMQ, daemon) and FEFF. The absolute easiest way to run them is to open this project in a **VS Code DevContainer** (`.devcontainer/`). The container fully configures AiiDA, downloads the FEFF8L binary, sets up both the `feff@localhost` and `python3@localhost` codes, and starts the daemon automatically on creation.
+> **Recommended environment:** the DevContainer in `.devcontainer/` gives you
+> a full IDE against a *real* AiiDA profile: SQLite storage, a RabbitMQ broker,
+> a running daemon, and both `feff@localhost` and `python3@localhost`
+> registered. Calculations you run there produce real nodes and a real
+> provenance graph, so `verdi` works as it would anywhere else.
 >
-> *If running outside the DevContainer, you must manually run `verdi` services, have a working FEFF executable, and register a Python executable as an installed code (`verdi code create core.code.installed ...`) named e.g. `python3@localhost` pointing to your virtual environment's Python interpreter.*
+> It runs on the host's own architecture, so it is equally at home in
+> **GitHub Codespaces** (Code → Codespaces → Create) and on a local Docker or
+> Podman. Verified end to end on Apple Silicon: `post-create.sh` completes,
+> FEFF8L runs, and the full test suite passes inside the container.
+>
+> FEFF8L is not downloaded; it ships inside the `xraylarch` dependency and the
+> container points a code at it. On arm64 those x86_64 binaries run through
+> the runtime's qemu handler, for which post-create installs the x86_64
+> loader. No PostgreSQL is involved: storage is `core.sqlite_dos`, the same
+> backend the tests use.
+>
+> **Podman users:** set `dockerComposeFile` in
+> `.devcontainer/devcontainer.json` to
+> `["docker-compose.yml", "docker-compose.podman.yml"]`. The override adds
+> `userns_mode: keep-id`, which Docker Engine rejects and which therefore
+> cannot live in the base file.
+>
+> *Outside the container you need a broker and daemon running, a working FEFF
+> executable, and a Python interpreter registered as an installed code
+> (`verdi code create core.code.installed ...`, e.g. `python3@localhost`) for
+> path aggregation.*
+
+The synthetic example covers the whole pipeline and doubles as the smoke test
+CI runs:
+
+```bash
+# Serial: one scheduler job per snapshot, with per-path contributions stored
+uv run python examples/example_ensemble_synthetic.py \
+    --code feff@localhost --python-code python3@localhost \
+    --n-snapshots 6 --store-paths --plot-file ensemble.png
+
+# Batch: one scheduler job per chunk, the mode intended for HPC. Produces a
+# consolidated ExafsArchiveData instead of per-snapshot shards.
+uv run python examples/example_ensemble_synthetic.py \
+    --code feff@localhost --python-code python3@localhost \
+    --n-snapshots 12 --batch-size 4 --plot-file ensemble.png
+
+# Reuse one set of scattering potentials across every snapshot
+uv run python examples/example_ensemble_synthetic.py \
+    --code feff@localhost --n-snapshots 6 --precompute-potentials
+```
+
+The ensemble runs need roughly 4 GB of RAM; below that the daemon is killed
+mid-run and the only symptom is exit 137.
 
 Pass a real `TrajectoryData` node, or use the synthetic-trajectory helper
 included in `examples/` to run a quick end-to-end test without any MD data:
@@ -188,7 +235,7 @@ before calling FEFF, so the SCF step is skipped for every snapshot.
 **Partial failures are isolated.**
 If an individual FEFF run crashes, the driver logs the error and continues with
 the remaining runs.  The batch job exits 0.  The parser detects missing
-`xmu.dat` files and skips those pairs; the workchain counts them as failures
+`chi.dat` files and skips those pairs; the workchain counts them as failures
 and produces a partial average (exit code 301) rather than aborting entirely.
 
 #### Setup: register codes on the HPC
@@ -348,10 +395,7 @@ chir = chi_k_to_r(xas_data=xas, ft_params=Dict({"kmin":3, "kmax":14, "kweight":2
 ### 6. Plotting (optional)
 
 ```python
-from aiida_feff.visualise import plot_mu_e, plot_chi_k, plot_chi_r
-
-# μ(E)
-fig = plot_mu_e(xas)
+from aiida_feff.visualise import plot_chi_k, plot_chi_r
 
 # k²χ(k)
 fig = plot_chi_k(xas, kweight=2)
@@ -369,56 +413,44 @@ plt.show()
 
 ### 7. Debye-Waller σ² from an MD trajectory (optional)
 
-Compute per-path MSRD (σ²) directly from a `TrajectoryData` node — no
-separate DW code needed.
+Per-path MSRD (σ²) is computed directly from the trajectory by
+[md-exafs](https://pypi.org/project/md-exafs/), which this plugin depends on.
 
-Two variants are provided:
-
-- `compute_msrd` / `compute_adp` — plain Python functions, return plain dicts/arrays.  **Not recorded in the database.**  Use these when exploring cutoffs and tolerances interactively.
-- `store_msrd` / `store_adp` — `@calcfunction` wrappers.  Accept and return AiiDA nodes; every call is recorded in the provenance graph.  Use these in workflows.
+**This step is deliberately not provenance-tracked.** σ² is cheap to recompute
+and the trajectory it derives from is already a stored node, so recording the
+result would add graph weight without adding recoverable information. The
+`store_msrd` / `store_adp` calcfunction wrappers that earlier versions shipped
+have been removed for that reason; call md-exafs directly.
 
 ```python
-from aiida_feff.calcfunctions.debye_waller import compute_msrd, store_msrd
-from aiida.orm import Dict
+from md_exafs.debye_waller import calculate_grouped_msrd
 
-params = {
-    "absorber_site": "Fe",   # element, "Fe.1" (first Fe), or "3" (1-based index)
-    "cutoff": 3.5,           # neighbour search radius in Å
-    "cutoff_3body": 3.0,     # include 3-body paths (omit to skip)
-    "skip_frames": 50,       # discard first N frames (equilibration)
-}
+from aiida_feff.utils import trajectory_to_structures
+
+structures = [s.get_ase() for s in trajectory_to_structures(traj_node)]
 
 # `cutoff` must stay below the inscribed-sphere radius of the cell, or the
 # minimum-image convention picks the wrong neighbour and biases σ² low.
-# compute_msrd raises rather than returning a quietly wrong number; build a
-# supercell, or pass allow_unsafe_cutoff=True if you accept the bias.
-# There is no `align` key: MSRD is computed from raw coordinates, because
-# Kabsch alignment rotates the frame away from the cell used for the MIC.
+# Build a supercell rather than raising the cutoff.
+two_body, three_body = calculate_grouped_msrd(
+    structures,
+    central_indices=[0],     # zero-based absorber indices
+    central_label="Fe",
+    cutoff=3.5,              # neighbour search radius in Å
+    cutoff_3body=3.0,        # include 3-body paths (omit to skip)
+)
 
-# Interactive exploration — no DB writes:
-result = compute_msrd(traj_node, params)
-for key, val in sorted(result.items(), key=lambda x: x[1]["reff"]):
-    print(f"{key}: reff={val['reff']:.3f} Å  σ²={val['sigma2']:.5f} Å²")
-
-# Store in provenance graph when happy with the parameters:
-msrd_node = store_msrd(trajectory=traj_node, params=Dict(params))
-# Fe-Fe_2p48_2body: reff=2.481 Å  σ²=0.00612 Å²
-# Fe-Fe_4p05_2body: reff=4.052 Å  σ²=0.00891 Å²
+for group in sorted(two_body, key=lambda g: g["reff"]):
+    print(f"{group['scatterer']}: reff={group['reff']:.3f} Å  σ²={group['sigma2']:.5f} Å²")
+# Fe: reff=2.481 Å  σ²=0.00612 Å²
+# Fe: reff=4.052 Å  σ²=0.00891 Å²
 ```
 
-Per-atom B-factors and full U tensors:
+The resulting σ² values can be passed straight to
+`aiida_feff.calcfunctions.exafs.total_chi` as a `scatterer -> σ²` mapping.
 
-```python
-from aiida_feff.calcfunctions.debye_waller import compute_adp, store_adp
-
-adp = compute_adp(traj_node, {"skip_frames": 50})
-print(adp["b_factors"])    # ndarray, shape (n_atoms,)
-print(adp["u_tensor"])     # ndarray, shape (n_atoms, 3, 3)
-
-# Or with provenance:
-adp_node = store_adp(trajectory=traj_node, params=Dict({"skip_frames": 50}))
-print(adp_node.get_array("b_factors"))
-```
+Per-atom B-factors and full U tensors come from the same module via
+`md_exafs.debye_waller.compute_adp_results`.
 
 ## CLI
 
@@ -442,8 +474,10 @@ EnsembleExafsWorkChain
   ├─ FeffCalculation × (N_frames × N_sites) ← one Slurm job each
   │    └─ FeffParser → XasData
   │
-  └─ average_xas_data (calcfunction)
-       └─ averaged XasData per site + grand average
+  ├─ create_serial_shard (calcfunction) → one shard, as the batch driver writes
+  │
+  └─ merge_exafs_shards (calcfunction) → ExafsArchiveData (archive)
+       └─ archive_to_averaged_xas (calcfunction) → averaged XasData per site + grand average
 ```
 
 ### Batch mode (HPC, hundreds of calculations)
@@ -466,9 +500,12 @@ EnsembleExafsWorkChain (batch_size=64)
   ├─ FeffBatchCalculation             ← next chunk, another Slurm job
   │    └─ …
   │
-  └─ average_xas_data (calcfunction)
-       └─ averaged XasData per site + grand average
+  └─ merge_exafs_shards (calcfunction) → ExafsArchiveData (archive)
+       └─ archive_to_averaged_xas (calcfunction) → averaged XasData per site + grand average
 ```
+
+Both routes end at the same merge, so the ensemble average has one
+implementation and `archive` is always produced.
 
 The FEFF environment (module loads, etc.) is read from `feff_code.prepend_text`
 at AiiDA submission time and embedded in `batch_config.json`.  On the compute
@@ -479,10 +516,13 @@ without requiring any extra code to be installed on the HPC.
 ## Development
 
 ```bash
-git clone https://github.com/youruser/aiida-feff
+git clone https://github.com/stfc/aiida-feff
 cd aiida-feff
-pip install -e .[testing]
-pytest tests/ -v
+uv sync --locked --extra testing --extra plots
+uv run pytest tests/
+
+# Lint exactly as CI does
+uv run pre-commit run --all-files
 ```
 
 ## Relationship to [larch-cli](https://github.com/stfc/alc-dls-exafs/)

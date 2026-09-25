@@ -134,10 +134,16 @@ class TestPathContributionsData:
         assert p.feff_data.shape == (4, 6)
 
     def test_feff_data_roundtrip(self):
-        """feff_data values survive the HDF5 round-trip."""
+        """feff_data values survive the HDF5 round-trip.
+
+        The datasets are float64, so the round trip is exact. A tolerance of
+        1e-6 (used previously) would tolerate a genuine precision loss --
+        e.g. the writer silently narrowing to float32.
+        """
         pc = _make_pc_node(n_paths=1)
         p = list(pc.iter_paths())[0]
-        np.testing.assert_allclose(p.feff_data[:, 1], np.linspace(0.5, 1.0, 4), rtol=1e-6)
+        assert p.feff_data.dtype == np.float64
+        np.testing.assert_array_equal(p.feff_data[:, 1], np.linspace(0.5, 1.0, 4))
 
     def test_info_n_paths(self):
         pc = _make_pc_node(n_paths=4)
@@ -423,3 +429,126 @@ class TestSyntheticSchemaMatchesTheWriter:
                 return set(f["paths"]), set(f["meta"].attrs)
 
         assert describe(_make_raw_hdf5()) == describe(aggregated_hdf5)
+
+
+class TestAgainstRealFeffOutput:
+    """Cross-check the reader against real Feff8L output, not only its own writer.
+
+    The ``TestPathContributionsData`` tests above read back fields that the
+    same file wrote via ``_make_raw_hdf5``. That pins the round trip but not
+    the interpretation: a reader and a hand-written fixture can agree with
+    each other while both disagreeing with FEFF. These assertions come from
+    the checked-in SrTiO3 Ti K-edge fixtures instead.
+    """
+
+    def test_metadata_matches_the_aggregation_config(self, aggregated_node):
+        info = aggregated_node.info()
+        # Set by the aggregated_hdf5 fixture's config.
+        assert info["frame_idx"] == 3
+        assert info["site_idx"] == 1
+        assert aggregated_node.absorber_element == "Ti"
+        assert not aggregated_node.is_merged
+
+    def test_path_geometry_matches_files_dat(self, aggregated_node):
+        """r_eff, nlegs and degeneracy must match the FEFF tabulation.
+
+        Values transcribed from ``tests/fixtures/aggregate_paths/files.dat``:
+
+            feff0001.dat  deg 1.000  nlegs 2  r_eff 1.8590
+            feff0007.dat  deg 2.000  nlegs 3  r_eff 3.1969
+        """
+        by_reff = {round(p.r_eff, 4): p for p in aggregated_node.iter_paths()}
+
+        first_shell = by_reff[1.8590]
+        assert first_shell.nlegs == 2
+        assert first_shell.degeneracy == pytest.approx(1.0)
+
+        multiple_scattering = by_reff[3.1969]
+        assert multiple_scattering.nlegs == 3
+        assert multiple_scattering.degeneracy == pytest.approx(2.0)
+
+    def test_all_paths_share_one_k_grid(self, aggregated_node):
+        """chi(k) summation over paths is only meaningful on a common grid."""
+        grids = [p.feff_data[:, 5] for p in aggregated_node.iter_paths()]
+        assert len(grids) > 1
+        for grid in grids[1:]:
+            np.testing.assert_array_equal(grid, grids[0])
+
+    def test_reff_is_half_the_total_path_length(self, aggregated_node):
+        """FEFF's convention, and the reason MS paths are not double-counted.
+
+        A 3-leg path visiting a scatterer at r_1 returns via r_2, so its
+        r_eff must exceed the longest single-scattering shell it is built
+        from, but stay below the total traversed length.
+        """
+        single = [p.r_eff for p in aggregated_node.iter_paths() if p.nlegs == 2]
+        multiple = [p.r_eff for p in aggregated_node.iter_paths() if p.nlegs > 2]
+        assert single and multiple
+        assert min(multiple) > min(single)
+
+
+# ---------------------------------------------------------------------------
+# create_serial_shard — the serial route's path handover
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("aiida_profile_clean")
+class TestSerialShardPathHandover:
+    """The serial route hands paths to md-exafs' shard writer.
+
+    Two dataclasses are called ``PathResult``: the one this package yields from
+    ``iter_paths`` and the one ``BatchShardWriter`` consumes. They differ, so
+    the handover has to convert. Passing ours through unchanged raised
+    ``AttributeError: 'PathResult' object has no attribute 'angle'`` deep inside
+    a calcfunction, and no unit test reached it because nothing here ran the
+    serial ensemble with path storage on.
+    """
+
+    def _xas_node(self, frame_idx: int = 0, site_idx: int = 0):
+        from md_exafs.execution import DEFAULT_K_GRID
+
+        from aiida_feff.data.xasdata import XasData
+
+        xas = XasData()
+        xas.set_chi(DEFAULT_K_GRID, np.sin(2.0 * DEFAULT_K_GRID))
+        xas.base.attributes.set("frame_index", frame_idx)
+        xas.base.attributes.set("site_index", site_idx)
+        xas.base.attributes.set("absorber_element", "Fe")
+        return xas.store()
+
+    def test_paths_reach_the_shard(self):
+        from aiida_feff.calcfunctions.archive import create_serial_shard
+
+        pc = _make_pc_node(frame_idx=0, site_idx=0, n_paths=3).store()
+        shard = create_serial_shard(
+            xas__snap_0000_site_0000=self._xas_node(),
+            paths__snap_0000_site_0000=pc,
+        )
+
+        stored = shard.iter_paths()
+        assert len(stored) == 3
+        # r_eff survives the conversion, so the paths are the ones we sent and
+        # not an empty set quietly written because the node was skipped.
+        assert sorted(round(p.r_eff, 2) for p in stored) == [2.48, 2.98, 3.48]
+
+    def test_missing_angle_becomes_the_unset_sentinel(self):
+        """aiida-feff records no scattering angle, and must not invent one."""
+        from aiida_feff.calcfunctions.archive import create_serial_shard
+
+        pc = _make_pc_node(n_paths=1).store()
+        shard = create_serial_shard(
+            xas__snap_0000_site_0000=self._xas_node(),
+            paths__snap_0000_site_0000=pc,
+        )
+
+        with shard.reader() as reader, reader._open() as f:
+            angles = np.array(f["tasks/frame_0000_site_0000/paths/angle"])
+        assert np.all(angles == -1.0)
+
+    def test_shard_is_written_without_paths(self):
+        """path storage is optional; the spectrum still has to get through."""
+        from aiida_feff.calcfunctions.archive import create_serial_shard
+
+        shard = create_serial_shard(xas__snap_0000_site_0000=self._xas_node())
+        assert shard.is_shard
+        assert np.isfinite(shard.chi).all()

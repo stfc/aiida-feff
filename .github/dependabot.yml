@@ -1,11 +1,29 @@
 version: 2
 updates:
-  - package-ecosystem: pip
+  # "uv", not "pip": this is a uv-managed project with a 1.2 MB uv.lock. The
+  # pip ecosystem edits the PEP 621 constraints in pyproject.toml but does not
+  # regenerate the lockfile, so its PRs would drift the manifest away from the
+  # lock -- which CI now rejects, since it syncs with --locked.
+  - package-ecosystem: uv
     directory: /
     schedule:
       interval: weekly
 
   - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+
+  # Keeps the digest-pinned images in .devcontainer/docker-compose.yml fresh.
+  # Without this, pinning by digest would mean never receiving security
+  # updates for the base image or the broker.
+  - package-ecosystem: docker-compose
+    directory: /.devcontainer
+    schedule:
+      interval: monthly
+
+  # Updates the digest-pinned devcontainer feature in devcontainer-lock.json.
+  - package-ecosystem: devcontainers
     directory: /
     schedule:
       interval: monthly

@@ -44,3 +44,24 @@ class TestParseFeffVersion:
         # for a version string.
         body = "\n".join(["padding"] * 40) + "\nfeff0001.dat\n"
         assert parse_feff_version(body) is None
+
+
+class TestPackageVersion:
+    def test_version_matches_the_installed_distribution(self):
+        """A hardcoded literal drifts; the metadata is what gets stamped.
+
+        ``versions.dependency_versions`` reports the installed distribution
+        version into node attributes, so a divergent ``__version__`` would
+        make the package report two different versions of itself.
+        """
+        from importlib.metadata import version
+
+        import aiida_feff
+
+        assert aiida_feff.__version__ == version("aiida-feff")
+
+    def test_version_is_reported_in_dependency_versions(self):
+        import aiida_feff
+        from aiida_feff.versions import dependency_versions
+
+        assert dependency_versions()["aiida-feff"] == aiida_feff.__version__

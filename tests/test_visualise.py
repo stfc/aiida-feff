@@ -16,19 +16,6 @@ def headless_backend():
     matplotlib.use("Agg")
 
 
-class TestPlotMuE:
-    def test_returns_a_figure(self, generate_xas_data, aiida_profile):
-        from aiida_feff.visualise import plot_mu_e
-
-        assert plot_mu_e(generate_xas_data()).axes
-
-    def test_mu0_is_optional_extra_trace(self, generate_xas_data, aiida_profile):
-        from aiida_feff.visualise import plot_mu_e
-
-        with_mu0 = plot_mu_e(generate_xas_data(), show_mu0=True)
-        assert len(with_mu0.axes[0].get_lines()) == 2
-
-
 class TestPlotChiK:
     def test_applies_k_weighting(self, generate_xas_data, aiida_profile):
         import numpy as np
@@ -72,16 +59,79 @@ class TestPlotChiR:
         with pytest.raises(TypeError, match="Expected XasData or ArrayData"):
             plot_chi_r(Int(1))
 
-    def test_inline_and_tracked_transforms_agree(self, generate_xas_data, aiida_profile):
-        """One FT implementation, so a plot cannot disagree with provenance."""
+    def test_the_plotted_curve_matches_the_tracked_transform(
+        self, generate_xas_data, aiida_profile
+    ):
+        """One FT implementation, so a plot cannot disagree with provenance.
+
+        Asserted through the curve that reaches matplotlib rather than through
+        a helper, because the helper is what a refactor moves and the drawn
+        line is what a reader believes.
+        """
         import numpy as np
 
         from aiida_feff.calcfunctions.larch import chi_k_to_r
-        from aiida_feff.visualise import _xftf_inline
+        from aiida_feff.visualise import plot_chi_r
 
         xas = generate_xas_data()
         ft = {"kmin": 2.0, "kmax": 12.0, "kweight": 2}
         tracked = chi_k_to_r(xas, Dict(ft))
-        r, mag, _re, _im, _params = _xftf_inline(xas, ft)
-        np.testing.assert_allclose(r, tracked.get_array("r"))
-        np.testing.assert_allclose(mag, tracked.get_array("chir_mag"))
+
+        fig = plot_chi_r(xas, ft_params=ft, component="mag")
+        r_plotted, mag_plotted = fig.axes[0].lines[-1].get_data()
+
+        np.testing.assert_allclose(r_plotted, tracked.get_array("r"))
+        np.testing.assert_allclose(mag_plotted, tracked.get_array("chir_mag"))
+
+
+class TestPlotStyling:
+    """Overlay styling must reach matplotlib.
+
+    Without this passthrough a caller wanting several curves on one axis has
+    to bypass these helpers and re-derive the k-weighting and the axis
+    labels, which is exactly how examples/ ended up with an untested second
+    copy of the plotting code.
+    """
+
+    def test_chi_k_forwards_style_to_the_line(self, generate_xas_data):
+        from aiida_feff.visualise import plot_chi_k
+
+        fig = plot_chi_k(generate_xas_data(), color="crimson", linestyle="--", lw=1.3, label="P1")
+        line = fig.axes[0].lines[-1]
+        assert line.get_linestyle() == "--"
+        assert line.get_label() == "P1"
+        assert line.get_linewidth() == 1.3
+
+    def test_chi_r_forwards_style_to_the_line(self, generate_xas_data):
+        from aiida_feff.visualise import plot_chi_r
+
+        fig = plot_chi_r(generate_xas_data(), color="crimson", linestyle=":", label="P2")
+        line = fig.axes[0].lines[-1]
+        assert line.get_linestyle() == ":"
+        assert line.get_label() == "P2"
+
+    def test_overlays_share_one_axis(self, generate_xas_data):
+        """Two calls with the same ax must add two lines, not two figures."""
+        from aiida_feff.visualise import plot_chi_k
+
+        fig = plot_chi_k(generate_xas_data(), label="a")
+        ax = fig.axes[0]
+        plot_chi_k(generate_xas_data(), ax=ax, label="b", color="grey")
+        assert len(ax.lines) == 2
+        assert [line.get_label() for line in ax.lines] == ["a", "b"]
+
+    def test_envelope_follows_the_line_colour(self, generate_xas_data, aiida_profile):
+        """A shaded band in a different colour from its line misreads as a second series."""
+        import numpy as np
+
+        from aiida_feff.data.xasdata import XasData
+        from aiida_feff.visualise import plot_chi_k
+
+        k = np.linspace(1.0, 12.0, 40)
+        node = XasData()
+        node.set_chi(k, np.sin(k))
+        node.set_array("chi_k_std", np.full_like(k, 0.05))
+
+        fig = plot_chi_k(node, color="crimson", plot_envelope=True)
+        collections = fig.axes[0].collections
+        assert collections, "envelope was not drawn"

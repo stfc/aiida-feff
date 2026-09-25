@@ -10,7 +10,6 @@ from pathlib import Path
 from aiida import orm
 from aiida.common import CalcInfo, CodeInfo, datastructures
 from aiida.engine import CalcJob, CalcJobProcessSpec
-from pymatgen.core import Structure
 
 from aiida_feff.data.parameters import FeffParameters
 from aiida_feff.data.pathcontributions import PathContributionsData
@@ -24,6 +23,8 @@ _GENERATOR_PACKAGES = ("aiida-feff", "pymatgen")
 # Files written to / retrieved from the remote working directory
 FEFF_INPUT_FILE = "feff.inp"
 FEFF_LOG_FILE = "log.dat"
+# Not retrieved: the plugin reads chi(k) from chi.dat and never needs mu(E).
+# Named so the retrieve lists can be asserted against it.
 FEFF_XMUDA_FILE = "xmu.dat"
 FEFF_CHI_FILE = "chi.dat"
 FEFF_PATHS_FILE = "paths.dat"
@@ -67,7 +68,7 @@ _SPECTRUM_MODULES = slice(3, 6)
 def is_potentials_only(control: str | None) -> bool:
     """True when a CONTROL card switches off the spectrum modules (4–6).
 
-    Such a run is *expected* to finish without ``xmu.dat``, so the parser must
+    Such a run is *expected* to finish without ``chi.dat``, so the parser must
     not confuse it with a FEFF crash — which is what treating exit code 310 as
     acceptable used to do.
     """
@@ -181,7 +182,7 @@ class FeffCalculation(CalcJob):
 
     Exit codes
     ----------
-    310  FEFF did not produce ``xmu.dat``.
+    310  FEFF did not produce ``chi.dat``.
     400  Unrecoverable parser error.
 
     Input combinations are rejected by the spec validator before a job is
@@ -197,7 +198,6 @@ class FeffCalculation(CalcJob):
     # ------------------------------------------------------------------
     _DEFAULT_RETRIEVE_LIST = [
         FEFF_LOG_FILE,
-        FEFF_XMUDA_FILE,
         FEFF_CHI_FILE,
         FEFF_PATHS_FILE,
         FEFF_FILES_DAT,  # amplitude ranking; small file, kept for provenance
@@ -327,7 +327,12 @@ class FeffCalculation(CalcJob):
         )
 
         # --- exit codes -------------------------------------------------------
-        spec.exit_code(310, "ERROR_MISSING_XMUDA", message="FEFF did not produce xmu.dat.")
+        spec.exit_code(310, "ERROR_MISSING_CHIDAT", message="FEFF did not produce chi.dat.")
+        spec.exit_code(
+            311,
+            "ERROR_POTENTIALS_INCOMPLETE",
+            message="Potentials-only run produced no FEFF output; it did not start.",
+        )
         spec.exit_code(400, "ERROR_PARSING_FAILED", message="Parser raised an exception: {reason}.")
 
         # Validate combinations up front: prepare_for_submission cannot report
@@ -483,66 +488,19 @@ class FeffCalculation(CalcJob):
         structure: orm.StructureData,
         parameters: FeffParameters,
     ) -> str:
-        """Construct the full text of ``feff.inp`` from AiiDA objects.
+        """Construct the full text of ``feff.inp`` from AiiDA objects delegating to md_exafs."""
+        from md_exafs.feff_input import build_feff_inp as core_build_feff_inp
 
-        Public because :class:`~aiida_feff.calculations.feff_batch.FeffBatchCalculation`
-        generates the same input for every pair in a batch.
+        cfg = parameters.to_feff_config()
+        user_tags = parameters.to_pymatgen_user_tags()
+        if "_del" in user_tags:
+            cfg.delete_tags = list(user_tags["_del"])
 
-        The card content comes from pymatgen's ``MPEXAFSSet``, whose defaults
-        live in an unversioned ``MPEXAFSSet.yaml`` shipped inside pymatgen — a
-        pymatgen upgrade can therefore change every generated input.  The
-        pymatgen version in use is recorded on the calcjob node.
-        """
-        from pymatgen.io.feff.sets import MPEXAFSSet
-
-        absorbing_idx = parameters.get("absorbing_atom", 0)
-        exclude_h = bool(parameters.get("exclude_hydrogen", False))
-
-        pmg_structure: Structure = structure.get_pymatgen_structure()
-
-        if exclude_h:
-            symbols = [site.species_string for site in pmg_structure.sites]
-            non_h = [i for i, sym in enumerate(symbols) if sym != "H"]
-            if absorbing_idx not in non_h:
-                raise ValueError(
-                    f"absorbing_atom index {absorbing_idx} is a hydrogen atom "
-                    "but exclude_hydrogen=True."
-                )
-            absorbing_idx = non_h.index(absorbing_idx)
-            pmg_structure.remove_sites([i for i, sym in enumerate(symbols) if sym == "H"])
-
-        user_settings = parameters.to_pymatgen_user_tags()
-        user_settings["RPATH"] = str(parameters.radius)
-
-        del_value = user_settings.pop("_del", None)
-        del_list: list[str] = []
-        if del_value is None:
-            pass
-        elif isinstance(del_value, str):
-            del_list = [del_value]
-        else:
-            del_list = list(del_value)
-
-        # FEFF8L rejects the COREHOLE card that MPEXAFSSet.yaml always emits,
-        # so it is stripped unconditionally.  Consequence: core-hole treatment
-        # is unreachable through this plugin while FEFF8L is the target.
-        for kw in ("COREHOLE", "COREHOLE FSR"):
-            if kw not in del_list:
-                del_list.append(kw)
-        if del_list:
-            user_settings["_del"] = del_list
-
+        absorbing_idx = int(parameters.get("absorbing_atom", 0))
         with _spglib_new_error_handling():
-            feff_set = MPEXAFSSet(
-                absorbing_atom=absorbing_idx,
-                structure=pmg_structure,
-                edge=parameters.edge,
-                radius=parameters.radius,
-                user_tag_settings=user_settings,
+            inp_text = core_build_feff_inp(
+                structure.get_pymatgen_structure(),
+                config=cfg,
+                absorber_idx=absorbing_idx,
             )
-            feff = feff_set.all_input()
-
-        blocks = [
-            str(feff[k]) for k in ["HEADER", "PARAMETERS", "POTENTIALS", "ATOMS"] if k in feff
-        ]
-        return "\n\n".join([_generator_banner(), *blocks])
+        return _generator_banner() + f"\n* Absorber site index: {absorbing_idx}\n\n" + inp_text

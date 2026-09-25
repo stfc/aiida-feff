@@ -120,7 +120,6 @@ def cmd_show(node):
         echo.echo_critical(f"Node {node.pk} is not an XasData node.")
 
     echo.echo(f"XasData PK={node.pk}  label='{node.label}'")
-    echo.echo(f"  e0            = {node.e0:.4f} eV  (energy array is relative to this)")
     for name in node.get_arraynames():
         arr = node.get_array(name)
         echo.echo(f"  {name:<14s}  shape={arr.shape}  dtype={arr.dtype}")

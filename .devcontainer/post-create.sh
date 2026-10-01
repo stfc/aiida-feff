@@ -62,7 +62,7 @@ if [ "$(uname -m)" = "aarch64" ] && ! dpkg -l libc6:amd64 &>/dev/null; then
   sudo apt-get install -y --no-install-recommends libc6:amd64
 fi
 
-# ── 0c. Memory check ────────────────────────────────────────────────────────
+# ── 0c. Memory check ─────────────────────────────────────────���──────────────
 # RabbitMQ, the daemon workers and a running workchain together need more than
 # a default 2 GB VM provides. The failure mode without this warning is a bare
 # SIGKILL (exit 137) partway through an example, with nothing explaining it.
@@ -80,8 +80,12 @@ fi
 # developers building the same commit months apart get the same uv, and so the
 # toolchain is not whatever the vendor is serving at container-creation time.
 UV_VERSION="0.11.21"
-if ! command -v uv &>/dev/null || [ "$(uv --version | awk '{print $2}')" != "$UV_VERSION" ]; then
-  curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+if ! command -v uv &>/dev/null 2>&1 || [ "$(uv --version | awk '{print $2}')" != "$UV_VERSION" ]; then
+  curl --fail --silent --show-error --location \
+    --retry 5 \
+    --retry-all-errors \
+    --retry-delay 2 \
+    "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
   export PATH="$HOME/.local/bin:$PATH"
 fi
 

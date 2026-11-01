@@ -74,7 +74,7 @@ services:
 
   rabbitmq:
     # rabbitmq:3.13-alpine
-    image: rabbitmq@sha256:d7af1c87c5f1eda13fcfca06db452bf3aeab6619fc3358b68535c0c02c4e52bc
+    image: rabbitmq@sha256:485319d42170eab53d8a030e1cc49d95e41f5d325479fa504736db8091981eb7
     environment:
       RABBITMQ_ERLANG_COOKIE: "devcontainer-cookie"
     volumes:

@@ -36,7 +36,7 @@ services:
     #
     # mcr.microsoft.com/devcontainers/python:3.12 (multi-arch index digest,
     # so this resolves on both architectures)
-    image: mcr.microsoft.com/devcontainers/python@sha256:a00123df1ec4af04b4013fda8c27438b73b1817a24f6bcd3d61e2f6aa0800302
+    image: mcr.microsoft.com/devcontainers/python@sha256:eb39f07323784af4c7558396808ceb01dacbe6dd7c63614f34d0235d0344a0ff
     volumes:
       - ..:/workspace:cached
       # Only AiiDA state is persisted. The virtualenv is NOT a volume: see
